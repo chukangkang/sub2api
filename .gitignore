@@ -14,6 +14,7 @@
 backend/bin/
 backend/server
 backend/sub2api
+backend/sub2api-linux
 backend/main
 
 # Go 测试二进制
