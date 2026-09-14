@@ -1,0 +1,419 @@
+package handler
+
+// 本文件实现 Anthropic /v1/messages 请求体的参数校验，
+// 对齐官方 Anthropic Messages API 的校验规则与错误消息格式。
+// 校验失败时返回符合官方风格的 error，由调用方以
+// 400 + invalid_request_error 响应给客户端。
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/tidwall/gjson"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
+)
+
+// validateAnthropicRequest 校验 Anthropic Messages API 请求体。
+// requireMaxTokens 控制是否要求 max_tokens 字段（/v1/messages 为 true，
+// /v1/messages/count_tokens 为 false）。
+// 返回 nil 表示校验通过，否则返回与官方 API 一致的错误消息。
+func validateAnthropicRequest(body []byte, requireMaxTokens bool) error {
+	// ── model: required string ──
+	model := gjson.GetBytes(body, "model")
+	if !model.Exists() || model.Type != gjson.String || model.Str == "" {
+		return fmt.Errorf("\"model\" is a required property")
+	}
+
+	// ── max_tokens: required (when requireMaxTokens), integer >= 1 ──
+	if requireMaxTokens {
+		mt := gjson.GetBytes(body, "max_tokens")
+		if !mt.Exists() {
+			return fmt.Errorf("\"max_tokens\" is a required property")
+		}
+		if mt.Type != gjson.Number {
+			return fmt.Errorf("\"max_tokens\" must be an integer")
+		}
+		if mt.Int() < 1 {
+			return fmt.Errorf("\"max_tokens\" must be greater than or equal to 1")
+		}
+	}
+
+	// ── messages: required, non-empty array ──
+	msgs := gjson.GetBytes(body, "messages")
+	if !msgs.Exists() {
+		return fmt.Errorf("\"messages\" is a required property")
+	}
+	if !msgs.IsArray() {
+		return fmt.Errorf("\"messages\" must be an array")
+	}
+	arr := msgs.Array()
+	if len(arr) == 0 {
+		return fmt.Errorf("\"messages\" must be a non-empty array")
+	}
+
+	// ── messages[i]: role + content ──
+	for i, m := range arr {
+		role := m.Get("role")
+		if !role.Exists() {
+			return fmt.Errorf("\"messages[%d].role\" is a required property", i)
+		}
+		if role.Type != gjson.String {
+			return fmt.Errorf("\"messages[%d].role\" must be a string", i)
+		}
+		if role.Str != "user" && role.Str != "assistant" {
+			return fmt.Errorf("\"messages[%d].role\" must be one of: \"user\", \"assistant\"", i)
+		}
+		if !m.Get("content").Exists() {
+			return fmt.Errorf("\"messages[%d].content\" is a required property", i)
+		}
+	}
+
+	// ── temperature: optional, 0.0 <= t <= 1.0 ──
+	// Opus 4.6 之后发布的模型仅接受 1.0（向后兼容），其他值 400
+	if t := gjson.GetBytes(body, "temperature"); t.Exists() {
+		if t.Type != gjson.Number {
+			return fmt.Errorf("\"temperature\" must be a number")
+		}
+		if f := t.Float(); f < 0.0 || f > 1.0 {
+			return fmt.Errorf("\"temperature\" must be between 0.0 and 1.0")
+		}
+		if familyRejectsSamplingParams(model.Str) && t.Float() != 1.0 {
+			return errors.New(`"temperature" must be 1.0 for this model`)
+		}
+	}
+
+	// ── top_p: optional, 0.0 <= tp <= 1.0 ──
+	// Opus 4.6 之后发布的模型仅接受 >= 0.99（向后兼容），其他值 400
+	if tp := gjson.GetBytes(body, "top_p"); tp.Exists() {
+		if tp.Type != gjson.Number {
+			return fmt.Errorf("\"top_p\" must be a number")
+		}
+		if f := tp.Float(); f < 0.0 || f > 1.0 {
+			return fmt.Errorf("\"top_p\" must be between 0.0 and 1.0")
+		}
+		if familyRejectsSamplingParams(model.Str) && tp.Float() < 0.99 {
+			return errors.New(`"top_p" must be >= 0.99 for this model`)
+		}
+	}
+
+	// ── top_k: optional, integer >= 1 ──
+	// Opus 4.6 之后发布的模型不接受任何 top_k 值
+	if tk := gjson.GetBytes(body, "top_k"); tk.Exists() {
+		if tk.Type != gjson.Number {
+			return fmt.Errorf("\"top_k\" must be an integer")
+		}
+		if tk.Int() < 1 {
+			return fmt.Errorf("\"top_k\" must be greater than or equal to 1")
+		}
+		if familyRejectsSamplingParams(model.Str) {
+			return errors.New(`"top_k" is not supported for this model`)
+		}
+	}
+
+	// ── thinking: optional, model-aware type validation ──
+	if th := gjson.GetBytes(body, "thinking"); th.Exists() {
+		tt := th.Get("type")
+		if !tt.Exists() {
+			return fmt.Errorf("\"thinking.type\" is a required property")
+		}
+
+		// Determine allowed thinking types based on model family.
+		allowed := allowedThinkingTypes(model.Str)
+		if !sliceContains(allowed, tt.Str) {
+			return thinkingTypeError(normalizeThinkingModelFamily(model.Str), tt.Str)
+		}
+
+		if tt.Str == "enabled" {
+			bt := th.Get("budget_tokens")
+			if !bt.Exists() {
+				return fmt.Errorf("\"thinking.budget_tokens\" is a required property")
+			}
+			if bt.Type != gjson.Number {
+				return fmt.Errorf("\"thinking.budget_tokens\" must be an integer")
+			}
+			if bt.Int() < 1024 {
+				return fmt.Errorf("\"thinking.budget_tokens\" must be greater than or equal to 1024")
+			}
+		}
+	}
+
+	// ── prefill: 4.6+ / Mythos Preview 不支持 assistant 预填充 ──
+	// 仅当最后一条 assistant 消息带文本内容时才视为 prefill；
+	// 仅含 tool_use 等结构化块的 assistant 消息不属于 prefill，放行交给上游判定。
+	if familySupportsPrefillReject(model.Str) && len(arr) > 0 {
+		last := arr[len(arr)-1]
+		if last.Get("role").Str == "assistant" && assistantHasTextContent(last) {
+			return errors.New(`This model does not support assistant message prefill. The conversation must end with a user message.`)
+		}
+	}
+
+	// ── tool_choice: Fable 5.1 / Mythos 5.1 不支持强制工具调用 ──
+	if tc := gjson.GetBytes(body, "tool_choice"); tc.Exists() {
+		tcType := tc.Get("type").Str
+		if (tcType == "tool" || tcType == "any") && familyRejectsForcedToolChoice(model.Str) {
+			return errors.New(`tool_choice: type "tool" and "any" are not supported for this model.`)
+		}
+	}
+
+	// ── max_tokens: 不得超过模型的最大输出上限 ──
+	// 官方对不同模型有不同的 max_tokens 上限，超过即 400。
+	// 仅对已知上限的模型收紧；未知模型放行交给上游判定。
+	if mt := gjson.GetBytes(body, "max_tokens"); mt.Exists() && mt.Type == gjson.Number {
+		if n := mt.Int(); n > 0 {
+			if cap, ok := modelMaxOutputTokens(model.Str); ok && n > int64(cap) {
+				return fmt.Errorf(`"max_tokens" must be less than or equal to %d for this model`, cap)
+			}
+		}
+	}
+
+	// ── output_config.effort: 取值必须合法且在模型支持的级别内 ──
+	if oc := gjson.GetBytes(body, "output_config"); oc.Exists() {
+		if eff := oc.Get("effort"); eff.Exists() {
+			if eff.Type != gjson.String {
+				return fmt.Errorf(`"output_config.effort" must be a string`)
+			}
+			if !sliceContains(allEffortLevels, eff.Str) {
+				return fmt.Errorf(`"output_config.effort" must be one of: %s`, joinQuoted(allEffortLevels))
+			}
+			if levels := claude.EffortLevelsForModel(model.Str); len(levels) > 0 && !sliceContains(levels, eff.Str) {
+				return fmt.Errorf(`"output_config.effort" value "%s" is not supported for this model`, eff.Str)
+			}
+		}
+	}
+
+	// ── speed: fast mode 仅 Opus 5 / Opus 4.8 支持，其余模型传 speed=fast 应 400 ──
+	if sp := gjson.GetBytes(body, "speed"); sp.Exists() && sp.Type == gjson.String && strings.EqualFold(sp.Str, "fast") {
+		if !modelSupportsFastMode(model.Str) {
+			return errors.New(`"speed" value "fast" is not supported for this model`)
+		}
+	}
+
+	return nil
+}
+
+// allEffortLevels 是官方 output_config.effort 的全部合法取值。
+var allEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
+
+// modelMaxOutputTokens 返回模型的同步 Messages API 最大输出 token 上限。
+// 依据官方 models overview：Fable 5.1 / Opus 5 / Sonnet 5 / Opus 4.7 / 4.8 /
+// Opus 4.6 / Sonnet 4.6 均为 128K；Haiku 4.5 为 64K。未知模型返回 ok=false（放行）。
+func modelMaxOutputTokens(model string) (int, bool) {
+	switch normalizeThinkingModelFamily(model) {
+	case "claude-fable-5-1", "claude-opus-5", "claude-sonnet-5",
+		"claude-opus-4-8", "claude-opus-4-7",
+		"claude-opus-4-6", "claude-sonnet-4-6":
+		return 128 * 1024, true
+	case "claude-haiku-4-5":
+		return 64 * 1024, true
+	}
+	return 0, false
+}
+
+// modelSupportsFastMode 判断模型是否支持 fast mode（speed=fast）。
+// 目前仅 Claude Opus 5 / Opus 4.8 支持；其余模型传 speed=fast 应 400。
+// 与 service.modelSupportsAnthropicFastMode 保持一致。
+func modelSupportsFastMode(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if !strings.Contains(m, "opus") {
+		return false
+	}
+	// "opus-5" 必须先判：不能用裸 "5" 匹配，否则 claude-opus-4-5 会被误判。
+	if strings.Contains(m, "opus-5") || strings.Contains(m, "opus5") {
+		return true
+	}
+	return strings.Contains(m, "4.8") || strings.Contains(m, "4-8")
+}
+
+// thinkingTypeError 返回与官方 API 完全一致的 thinking.type 拒绝消息。
+// 参见 https://platform.claude.com/docs/en/api/errors#common-validation-errors
+func thinkingTypeError(family, requested string) error {
+	switch requested {
+	case "enabled":
+		// Claude 4.7+ 移除了 extended thinking
+		return errors.New(`"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`)
+	case "adaptive":
+		// 仅支持 extended thinking 的模型（Claude 4.5 及更早）
+		return errors.New(`adaptive thinking is not supported on this model`)
+	case "disabled":
+		// Fable 5.1 / Mythos 5.1 / Fable 5 / Mythos 5
+		if family == "claude-mythos-preview" {
+			return errors.New(`"thinking.type.disabled" is not supported for this model. Thinking defaults to adaptive mode when not specified; use "thinking.type.enabled" with "budget_tokens" for extended thinking.`)
+		}
+		return errors.New(`"thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`)
+	default:
+		return fmt.Errorf("\"thinking.type\" must be one of: %s", joinQuoted(allThinkingTypes))
+	}
+}
+
+// familySupportsPrefillReject 判断模型是否属于「不支持 assistant prefill」的范围：
+// Claude 4.6 及之后的所有模型，以及 Claude Mythos Preview。
+func familySupportsPrefillReject(model string) bool {
+	family := normalizeThinkingModelFamily(model)
+	if family == "claude-mythos-preview" {
+		return true
+	}
+	// 已知会拒绝 prefill 的家族白名单（4.6+）
+	switch family {
+	case "claude-opus-4-6", "claude-sonnet-4-6",
+		"claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+		"claude-sonnet-5",
+		"claude-fable-5", "claude-fable-5-1",
+		"claude-mythos-5", "claude-mythos-5-1":
+		return true
+	}
+	return false
+}
+
+// familyRejectsForcedToolChoice 判断模型是否拒绝 tool_choice 的 "tool"/"any"：
+// Claude Fable 5.1 与 Claude Mythos 5.1。
+func familyRejectsForcedToolChoice(model string) bool {
+	switch normalizeThinkingModelFamily(model) {
+	case "claude-fable-5-1", "claude-mythos-5-1":
+		return true
+	}
+	return false
+}
+
+// familyRejectsSamplingParams 判断模型是否拒绝非默认采样参数：
+// Claude Opus 4.6 之后发布的模型（temperature 仅接受 1.0、top_p 仅接受 >= 0.99、
+// top_k 一律拒绝）。Opus 4.6 / Sonnet 4.6 是最后支持采样参数的模型。
+func familyRejectsSamplingParams(model string) bool {
+	family := normalizeThinkingModelFamily(model)
+	if family == "claude-mythos-preview" {
+		return true
+	}
+	switch family {
+	case "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+		"claude-sonnet-5",
+		"claude-fable-5", "claude-fable-5-1",
+		"claude-mythos-5", "claude-mythos-5-1":
+		return true
+	}
+	return false
+}
+
+// assistantHasTextContent 判断 assistant 消息是否带有文本内容（即构成 prefill）。
+// content 为字符串时直接视为文本；为数组时任一 text 块非空即为 true。
+// 解析不确定时保守返回 false（放行，交给上游判定），避免误伤合法流量。
+func assistantHasTextContent(msg gjson.Result) bool {
+	content := msg.Get("content")
+	if content.IsArray() {
+		for _, block := range content.Array() {
+			if block.Get("type").Str == "text" && strings.TrimSpace(block.Get("text").Str) != "" {
+				return true
+			}
+		}
+		return false
+	}
+	if content.Type == gjson.String {
+		return strings.TrimSpace(content.Str) != ""
+	}
+	return false
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Model-aware thinking.type validation
+//
+// Based on the official Anthropic documentation:
+//
+//	| Model Family          | Allowed thinking.type       | Rejected with 400       |
+//	|-----------------------|-----------------------------|-------------------------|
+//	| Fable 5.1 / 5        | adaptive                    | enabled, disabled       |
+//	| Mythos 5.1 / 5       | adaptive                    | enabled, disabled       |
+//	| Opus 5               | adaptive                    | enabled, disabled       |
+//	| Opus 4.8 / 4.7       | adaptive                    | enabled                 |
+//	| Sonnet 5             | adaptive                    | enabled                 |
+//	| Mythos Preview       | adaptive, enabled           | disabled                |
+//	| Opus 4.6 / Sonnet 4.6| adaptive, enabled (deprec.) | (none)                |
+//	| Opus 4.5             | enabled, disabled           | adaptive                |
+//	| Haiku 4.5            | enabled, disabled           | adaptive                |
+//	| Sonnet 4.5           | enabled, disabled           | adaptive                |
+//
+// Models not in the table accept all three types (backward compat).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// thinkingTypeRules maps normalized model family → allowed thinking.type values.
+// Normalization strips date suffixes (-20251101) and -thinking suffix.
+var thinkingTypeRules = map[string][]string{
+	// 仅自适应 (adaptive only; enabled/disabled 均以 400 拒绝)
+	"claude-fable-5-1":  {"adaptive"},
+	"claude-mythos-5-1": {"adaptive"},
+	"claude-fable-5":    {"adaptive"},
+	"claude-mythos-5":   {"adaptive"},
+	"claude-opus-5":     {"adaptive"},
+
+	// 自适应为主，默认关闭 (adaptive + disabled; 仅 enabled 被 400 拒绝)
+	"claude-opus-4-8": {"adaptive", "disabled"},
+	"claude-opus-4-7": {"adaptive", "disabled"},
+	"claude-sonnet-5": {"adaptive", "disabled"},
+
+	// 自适应 + 扩展 (adaptive + enabled; 仅 disabled 被 400 拒绝)
+	"claude-mythos-preview": {"adaptive", "enabled"},
+
+	// 仅扩展 (enabled + disabled; adaptive 被 400 拒绝)
+	"claude-opus-4-5":   {"enabled", "disabled"},
+	"claude-haiku-4-5":  {"enabled", "disabled"},
+	"claude-sonnet-4-5": {"enabled", "disabled"},
+
+	// Opus 4.6 / Sonnet 4.6: 自适应/扩展均已弃用，不限制（无需条目，fallthrough 接受全部）
+}
+
+// allThinkingTypes is the fallback for unknown models.
+var allThinkingTypes = []string{"enabled", "disabled", "adaptive"}
+
+// allowedThinkingTypes returns the allowed thinking.type values for a model.
+func allowedThinkingTypes(model string) []string {
+	family := normalizeThinkingModelFamily(model)
+	if allowed, ok := thinkingTypeRules[family]; ok {
+		return allowed
+	}
+	return allThinkingTypes
+}
+
+// normalizeThinkingModelFamily strips date suffixes (-YYYYMMDD) and -thinking
+// suffix from a model ID to get the base family key.
+func normalizeThinkingModelFamily(model string) string {
+	m := strings.ToLower(model)
+	// Strip trailing date suffix like -20251101 (8 digits after a dash)
+	if len(m) >= 10 {
+		dashIdx := len(m) - 9
+		if m[dashIdx] == '-' {
+			allDigits := true
+			for i := dashIdx + 1; i < len(m); i++ {
+				if m[i] < '0' || m[i] > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				m = m[:dashIdx]
+			}
+		}
+	}
+	// Strip -thinking suffix
+	m = strings.TrimSuffix(m, "-thinking")
+	return m
+}
+
+func sliceContains(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func joinQuoted(items []string) string {
+	quoted := make([]string, len(items))
+	for i, s := range items {
+		quoted[i] = fmt.Sprintf("%q", s)
+	}
+	result := quoted[0]
+	for _, q := range quoted[1:] {
+		result += ", " + q
+	}
+	return result
+}
