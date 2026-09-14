@@ -2069,9 +2069,12 @@ func (h *GatewayHandler) errorResponseWithCode(c *gin.Context, status int, errTy
 		"type":  "error",
 		"error": errorObject,
 	}
-	// 与官方 API 保持一致：错误响应体包含顶层 request_id 字段
+	// 与官方 API 保持一致：错误响应体包含顶层 request_id 字段，
+	// 且响应头携带 request-id（官方两者同源）。
 	if requestID, _ := c.Request.Context().Value(ctxkey.RequestID).(string); strings.TrimSpace(requestID) != "" {
-		payload["request_id"] = requestID
+		officialID := "req_" + requestID
+		payload["request_id"] = officialID
+		c.Header("request-id", officialID)
 	}
 	c.JSON(status, payload)
 }
