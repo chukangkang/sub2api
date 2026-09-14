@@ -145,7 +145,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	body, err := readLenientJSONRequestBodyWithPrealloc(c.Request, h.cfg)
 	if err != nil {
 		if maxErr, ok := extractMaxBytesError(err); ok {
-			h.errorResponse(c, http.StatusRequestEntityTooLarge, "invalid_request_error", buildBodyTooLargeMessage(maxErr.Limit))
+			h.errorResponse(c, http.StatusRequestEntityTooLarge, "request_too_large", buildBodyTooLargeMessage(maxErr.Limit))
 			return
 		}
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
@@ -213,11 +213,12 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	pricingCtx, pricingAt := service.WithGatewayTokenRequestPricing(c.Request.Context())
 	c.Request = c.Request.WithContext(pricingCtx)
 
-	// 验证 model 必填
-	if reqModel == "" {
-		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
+	// Anthropic 官方 API 参数校验（对齐官方校验规则与错误消息）
+	if verr := validateAnthropicRequest(body, true); verr != nil {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", verr.Error())
 		return
 	}
+
 	if !compositeTargetPlatformResolved(c, apiKey, reqModel) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by composite groups")
 		return
@@ -2064,10 +2065,15 @@ func (h *GatewayHandler) errorResponseWithCode(c *gin.Context, status int, errTy
 	if code != "" {
 		errorObject["code"] = code
 	}
-	c.JSON(status, gin.H{
+	payload := gin.H{
 		"type":  "error",
 		"error": errorObject,
-	})
+	}
+	// 与官方 API 保持一致：错误响应体包含顶层 request_id 字段
+	if requestID, _ := c.Request.Context().Value(ctxkey.RequestID).(string); strings.TrimSpace(requestID) != "" {
+		payload["request_id"] = requestID
+	}
+	c.JSON(status, payload)
 }
 
 // CountTokens handles token counting endpoint
@@ -2098,7 +2104,7 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 	body, err := readLenientJSONRequestBodyWithPrealloc(c.Request, h.cfg)
 	if err != nil {
 		if maxErr, ok := extractMaxBytesError(err); ok {
-			h.errorResponse(c, http.StatusRequestEntityTooLarge, "invalid_request_error", buildBodyTooLargeMessage(maxErr.Limit))
+			h.errorResponse(c, http.StatusRequestEntityTooLarge, "request_too_large", buildBodyTooLargeMessage(maxErr.Limit))
 			return
 		}
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
@@ -2127,11 +2133,12 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 	// 在请求上下文中记录 thinking 状态，供 Antigravity 最终模型 key 推导/模型维度限流使用
 	c.Request = c.Request.WithContext(service.WithThinkingEnabled(c.Request.Context(), parsedReq.ThinkingEnabled, h.metadataBridgeEnabled()))
 
-	// 验证 model 必填
-	if parsedReq.Model == "" {
-		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
+	// Anthropic 官方 API 参数校验（count_tokens 不要求 max_tokens）
+	if verr := validateAnthropicRequest(body, false); verr != nil {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", verr.Error())
 		return
 	}
+
 	if !compositeTargetPlatformResolved(c, apiKey, parsedReq.Model) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by composite groups")
 		return
