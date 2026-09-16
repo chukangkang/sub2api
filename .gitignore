@@ -88,6 +88,13 @@ temp/
 .dev/
 .serena/
 
+# 本地 API 探测残留（请求体/响应/带 key 的脚本，勿入库）
+/tmp_*.json
+/tmp_*.txt
+/body_*.json
+/v_*.json
+/poll.ps1
+
 # ===================
 # 构建产物
 # ===================
