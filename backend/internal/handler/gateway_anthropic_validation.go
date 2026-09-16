@@ -18,8 +18,10 @@ import (
 // validateAnthropicRequest 校验 Anthropic Messages API 请求体。
 // requireMaxTokens 控制是否要求 max_tokens 字段（/v1/messages 为 true，
 // /v1/messages/count_tokens 为 false）。
+// betaHeader 是请求头 anthropic-beta 的原始值（可为空），用于
+// 校验依赖 beta 的功能（如 thinking.display="updates"）。
 // 返回 nil 表示校验通过，否则返回与官方 API 一致的错误消息。
-func validateAnthropicRequest(body []byte, requireMaxTokens bool) error {
+func validateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader string) error {
 	// ── model: required string ──
 	model := gjson.GetBytes(body, "model")
 	if !model.Exists() || model.Type != gjson.String || model.Str == "" {
@@ -125,6 +127,29 @@ func validateAnthropicRequest(body []byte, requireMaxTokens bool) error {
 			return thinkingTypeError(normalizeThinkingModelFamily(model.Str), tt.Str)
 		}
 
+		// ── thinking.display: 枚举 + beta 门控 + disabled 禁配 ──
+		// 官方：display ∈ {summarized, omitted, updates}；
+		// "updates" 需 beta header thinking-display-updates-2026-08-18，
+		// 缺失时与未知 display 值一样 400；type=disabled 时无东西可展示，
+		// 携带 display 即 400。
+		if disp := th.Get("display"); disp.Exists() {
+			if disp.Type != gjson.String {
+				return fmt.Errorf(`"thinking.display" must be a string`)
+			}
+			if tt.Str == "disabled" {
+				return errors.New(`"thinking.display" is not supported when "thinking.type" is "disabled"`)
+			}
+			switch disp.Str {
+			case "summarized", "omitted":
+			case "updates":
+				if !betaHeaderContains(betaHeader, claude.BetaThinkingDisplayUpdates) {
+					return fmt.Errorf(`"thinking.display" value "updates" requires the beta header %s`, claude.BetaThinkingDisplayUpdates)
+				}
+			default:
+				return errors.New(`"thinking.display" must be one of: "summarized", "omitted", "updates"`)
+			}
+		}
+
 		if tt.Str == "enabled" {
 			bt := th.Get("budget_tokens")
 			if !bt.Exists() {
@@ -179,6 +204,17 @@ func validateAnthropicRequest(body []byte, requireMaxTokens bool) error {
 			}
 			if levels := claude.EffortLevelsForModel(model.Str); len(levels) > 0 && !sliceContains(levels, eff.Str) {
 				return fmt.Errorf(`"output_config.effort" value "%s" is not supported for this model`, eff.Str)
+			}
+		}
+	}
+
+	// ── thinking.type=disabled + effort=xhigh/max 组合：Opus 5 起不可关思考 ──
+	// 官方：Claude Opus 5 及之后模型在 xhigh/max effort 下无法关闭 thinking，
+	// 两者组合返回 400。低档 effort（≤high）允许 disabled。
+	if th := gjson.GetBytes(body, "thinking"); th.Exists() && th.Get("type").Str == "disabled" {
+		if eff := gjson.GetBytes(body, "output_config.effort"); eff.Exists() && eff.Type == gjson.String {
+			if eff.Str == "xhigh" || eff.Str == "max" {
+				return errors.New(`"thinking.type" value "disabled" is not supported with "output_config.effort" value "`+eff.Str+`" for this model`)
 			}
 		}
 	}
@@ -320,9 +356,9 @@ func assistantHasTextContent(msg gjson.Result) bool {
 //
 //	| Model Family          | Allowed thinking.type       | Rejected with 400       |
 //	|-----------------------|-----------------------------|-------------------------|
-//	| Fable 5.1 / 5        | adaptive                    | enabled, disabled       |
-//	| Mythos 5.1 / 5       | adaptive                    | enabled, disabled       |
-//	| Opus 5               | adaptive                    | enabled, disabled       |
+//	| Fable 5.1 / 5        | adaptive, disabled*         | enabled                 |
+//	| Mythos 5.1 / 5       | adaptive, disabled*         | enabled                 |
+//	| Opus 5               | adaptive, disabled          | enabled                 |
 //	| Opus 4.8 / 4.7       | adaptive                    | enabled                 |
 //	| Sonnet 5             | adaptive                    | enabled                 |
 //	| Mythos Preview       | adaptive, enabled           | disabled                |
@@ -331,18 +367,23 @@ func assistantHasTextContent(msg gjson.Result) bool {
 //	| Haiku 4.5            | enabled, disabled           | adaptive                |
 //	| Sonnet 4.5           | enabled, disabled           | adaptive                |
 //
+//	* 官方文档称 Fable/Mythos 5.x 拒绝 disabled，但实测返回 200，按实测放宽。
+//
 // Models not in the table accept all three types (backward compat).
 // ─────────────────────────────────────────────────────────────────────────────
 
 // thinkingTypeRules maps normalized model family → allowed thinking.type values.
 // Normalization strips date suffixes (-20251101) and -thinking suffix.
 var thinkingTypeRules = map[string][]string{
-	// 仅自适应 (adaptive only; enabled/disabled 均以 400 拒绝)
-	"claude-fable-5-1":  {"adaptive"},
-	"claude-mythos-5-1": {"adaptive"},
-	"claude-fable-5":    {"adaptive"},
-	"claude-mythos-5":   {"adaptive"},
-	"claude-opus-5":     {"adaptive"},
+	// 自适应为主 (adaptive + disabled; 仅 enabled 被 400 拒绝)。
+	// 注：官方文档称 Fable/Mythos 5.x 拒绝 disabled，但实测（用户矩阵
+	// a10/a11）这些模型对 disabled 返回 200，故按实测放宽；
+	// Opus 5 官方明文接受 disabled（effort ≤ high 时）。
+	"claude-fable-5-1":  {"adaptive", "disabled"},
+	"claude-mythos-5-1": {"adaptive", "disabled"},
+	"claude-fable-5":    {"adaptive", "disabled"},
+	"claude-mythos-5":   {"adaptive", "disabled"},
+	"claude-opus-5":     {"adaptive", "disabled"},
 
 	// 自适应为主，默认关闭 (adaptive + disabled; 仅 enabled 被 400 拒绝)
 	"claude-opus-4-8": {"adaptive", "disabled"},
@@ -400,6 +441,16 @@ func normalizeThinkingModelFamily(model string) string {
 func sliceContains(slice []string, s string) bool {
 	for _, v := range slice {
 		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// betaHeaderContains 判断 anthropic-beta 请求头（逗号分隔列表）是否包含指定 beta。
+func betaHeaderContains(header, beta string) bool {
+	for _, part := range strings.Split(header, ",") {
+		if strings.TrimSpace(part) == beta {
 			return true
 		}
 	}

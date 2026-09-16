@@ -28,6 +28,10 @@ const (
 	BetaMidConversationOutputConfig = "mid-conversation-output-config-2026-07-01"
 	BetaExtendedCacheTTL            = "extended-cache-ttl-2025-04-11"
 
+	// thinking.display="updates" 专用 beta（官方明文：缺此 header 时
+	// display=updates 与未知 display 值一样返回 400 invalid_request_error）。
+	BetaThinkingDisplayUpdates = "thinking-display-updates-2026-08-18"
+
 	// server-side refusal fallback beta 字段族（beta Messages API 专有）。
 	// 客户端（Claude Code / SDK / OpenCode 等）会默认透传 body.fallbacks /
 	// body.fallback_credit_token，上游仅在 anthropic-beta 携带对应 token 时接受；

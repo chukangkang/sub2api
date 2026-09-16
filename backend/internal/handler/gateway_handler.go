@@ -214,7 +214,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	c.Request = c.Request.WithContext(pricingCtx)
 
 	// Anthropic 官方 API 参数校验（对齐官方校验规则与错误消息）
-	if verr := validateAnthropicRequest(body, true); verr != nil {
+	if verr := validateAnthropicRequest(body, true, c.GetHeader("anthropic-beta")); verr != nil {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", verr.Error())
 		return
 	}
@@ -2137,7 +2137,7 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 	c.Request = c.Request.WithContext(service.WithThinkingEnabled(c.Request.Context(), parsedReq.ThinkingEnabled, h.metadataBridgeEnabled()))
 
 	// Anthropic 官方 API 参数校验（count_tokens 不要求 max_tokens）
-	if verr := validateAnthropicRequest(body, false); verr != nil {
+	if verr := validateAnthropicRequest(body, false, c.GetHeader("anthropic-beta")); verr != nil {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", verr.Error())
 		return
 	}
