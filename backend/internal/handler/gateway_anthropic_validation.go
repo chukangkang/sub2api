@@ -161,6 +161,18 @@ func validateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 			if bt.Int() < 1024 {
 				return fmt.Errorf("\"thinking.budget_tokens\" must be greater than or equal to 1024")
 			}
+			// 官方：budget_tokens 必须严格小于 max_tokens（thinking tokens 计入
+			// max_tokens，须为最终回复留出空间）。实测官方原文：
+			//   `max_tokens` must be greater than `thinking.budget_tokens`.
+			// 例外：interleaved thinking（anthropic-beta 携带
+			// interleaved-thinking-2025-05-14）时 budget 横跨同一 assistant
+			// turn 的所有 thinking 块，允许超过 max_tokens。
+			// count_tokens 端点无 max_tokens，无从比较，放行。
+			if mt := gjson.GetBytes(body, "max_tokens"); mt.Exists() && mt.Type == gjson.Number {
+				if bt.Int() >= mt.Int() && !betaHeaderContains(betaHeader, claude.BetaInterleavedThinking) {
+					return errors.New("`max_tokens` must be greater than `thinking.budget_tokens`.")
+				}
+			}
 		}
 	}
 
