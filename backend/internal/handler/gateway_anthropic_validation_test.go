@@ -696,11 +696,12 @@ func TestValidateAnthropicRequest_ForcedToolChoiceAllowedElsewhere(t *testing.T)
 // ── max_tokens 上限校验 ──
 
 func TestValidateAnthropicRequest_MaxTokensAboveCapRejected(t *testing.T) {
-	// 128K 上限模型：官方 "128K" 是十进制 128000（实测 128001 官方 400），cap+1 应 400
+	// 128K 上限模型：官方 "128K" 是十进制 128000（实测 128001 官方 400），cap+1 应 400。
+	// 文案与官方 API 逐字一致（pydantic 风格）。
 	body := `{"model": "claude-opus-5", "max_tokens": 128001, "messages": [{"role": "user", "content": "hi"}]}`
 	err := validateAnthropicRequest([]byte(body), true, "")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), `"max_tokens" must be less than or equal to 128000`)
+	require.Equal(t, `'max_tokens': 128001 > 128000 - 'max_tokens' should be smaller than or equal to 128000`, err.Error())
 }
 
 func TestValidateAnthropicRequest_MaxTokensAtCapAccepted(t *testing.T) {
@@ -710,11 +711,11 @@ func TestValidateAnthropicRequest_MaxTokensAtCapAccepted(t *testing.T) {
 }
 
 func TestValidateAnthropicRequest_MaxTokensHaikuCap(t *testing.T) {
-	// Haiku 4.5 上限 64K（十进制 64000）
+	// Haiku 4.5 上限 64K（十进制 64000），文案与官方逐字一致
 	body := `{"model": "claude-haiku-4-5", "max_tokens": 64001, "messages": [{"role": "user", "content": "hi"}]}`
 	err := validateAnthropicRequest([]byte(body), true, "")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), `"max_tokens" must be less than or equal to 64000`)
+	require.Equal(t, `'max_tokens': 64001 > 64000 - 'max_tokens' should be smaller than or equal to 64000`, err.Error())
 }
 
 func TestValidateAnthropicRequest_MaxTokensUnknownModelUntouched(t *testing.T) {
