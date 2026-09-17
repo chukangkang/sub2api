@@ -154,6 +154,7 @@ func TestOpenAIGatewayHandlerImages_ServerErrorFailsOverAndReturnsClearErrorWhen
 		nil,
 		nil,
 		cfg,
+		nil,
 	)
 	handler.maxAccountSwitches = 10
 

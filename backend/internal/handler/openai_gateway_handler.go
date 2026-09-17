@@ -47,6 +47,9 @@ type OpenAIGatewayHandler struct {
 	imageLimiter               *imageConcurrencyLimiter
 	maxAccountSwitches         int
 	cfg                        *config.Config
+	// settingService 用于 /v1/messages 桥接路径的官方参数校验开关
+	// （thinking_signature_validation 等）。nil 时按默认值处理。
+	settingService *service.SettingService
 }
 
 type openAIWSTurnChannelMappingSnapshot struct {
@@ -350,6 +353,7 @@ func NewOpenAIGatewayHandler(
 	contentModerationService *service.ContentModerationService,
 	opsService *service.OpsService,
 	cfg *config.Config,
+	settingService *service.SettingService,
 ) *OpenAIGatewayHandler {
 	pingInterval := time.Duration(0)
 	maxAccountSwitches := 3
@@ -371,6 +375,7 @@ func NewOpenAIGatewayHandler(
 		imageLimiter:             &imageConcurrencyLimiter{},
 		maxAccountSwitches:       maxAccountSwitches,
 		cfg:                      cfg,
+		settingService:           settingService,
 	}
 }
 
@@ -1127,6 +1132,35 @@ func (h *OpenAIGatewayHandler) logOpenAIRemoteCompactOutcome(c *gin.Context, sta
 
 // Messages handles Anthropic Messages API requests routed to OpenAI platform.
 // POST /v1/messages (when group platform is OpenAI)
+// validateAnthropicBridgeRequest 对经 OpenAI 桥接路径进来的 /v1/messages 请求
+// 做 Anthropic 官方参数校验。仅当请求模型属于 Claude 家族时生效；其他模型
+// （grok / deepseek / qwen 等）直接放行，保持既有透传行为。
+//
+// 背景：本桥接会把 Anthropic body 转成 OpenAI chat/completions 转发，
+// thinking / output_config / display / speed 等 Anthropic 专有字段在转换时被
+// 丢弃。若不在此处先行校验，非法参数（如 Opus 5 上传 thinking.type=enabled、
+// 假枚举值 __bogus__）会被静默放行，导致探针/客户端观察到"全都 200"。
+//
+// requireMaxTokens 区分 /v1/messages(true) 与 count_tokens(false)。
+// 返回 false 表示已写出 400 响应，调用方应立即 return。
+func (h *OpenAIGatewayHandler) validateAnthropicBridgeRequest(c *gin.Context, body []byte, reqModel string, requireMaxTokens bool) bool {
+	if !isClaudeFamilyModel(reqModel) {
+		return true
+	}
+	if verr := validateAnthropicRequest(body, requireMaxTokens, c.GetHeader("anthropic-beta")); verr != nil {
+		h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", verr.Error())
+		return false
+	}
+	// thinking 块签名结构校验（可配置，默认开）：与原生 Anthropic 路径一致。
+	if h.settingService != nil && h.settingService.IsThinkingSignatureValidationEnabled(c.Request.Context()) {
+		if serr := validateThinkingSignatures(body); serr != nil {
+			h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", serr.Error())
+			return false
+		}
+	}
+	return true
+}
+
 func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	streamStarted := false
 	defer h.recoverAnthropicMessagesPanic(c, &streamStarted)
@@ -1189,6 +1223,16 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		return
 	}
 	reqModel := modelResult.String()
+
+	// Anthropic 官方参数校验：仅对 Claude 家族模型生效。
+	// 本桥接会把 Anthropic body 转成 OpenAI chat/completions 转发，
+	// thinking / output_config / display / speed 等专有字段在转换时被丢弃，
+	// 若不在此处校验，非法参数（如 Opus 5 上传 enabled、假枚举值）会被静默放行。
+	// 非 Claude 模型（grok / deepseek / qwen 等）保持既有透传行为，不受影响。
+	if !h.validateAnthropicBridgeRequest(c, body, reqModel, true) {
+		return
+	}
+
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	if !openAICompatibleTextTargetAllowed(c, apiKey, reqModel) {
 		h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")

@@ -2240,6 +2240,7 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 		nil,
 		nil,
 		cfg,
+		nil,
 	)
 
 	rec := httptest.NewRecorder()
@@ -2341,6 +2342,7 @@ func TestOpenAIResponses_APIKeyPassthroughPoolAuthFailureRetriesThenSwitchesToHe
 				nil,
 				nil,
 				cfg,
+				nil,
 			)
 
 			rec := httptest.NewRecorder()
@@ -2423,6 +2425,7 @@ func TestOpenAIResponses_APIKeyPassthroughSSERateLimitUsesConfiguredPoolRetry(t 
 		nil,
 		nil,
 		cfg,
+		nil,
 	)
 
 	rec := httptest.NewRecorder()
@@ -3198,4 +3201,122 @@ data: {"type":"response.failed","error":{"message":"This content was flagged"}}
 
 		require.False(t, openAIForwardErrorAlreadyCommunicated(c, c.Writer.Size(), errors.New("openai cyber_policy: blocked")))
 	})
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI 桥接路径 /v1/messages 的 Anthropic 官方校验回归
+//
+// 背景：/v1/messages 按分组平台分流，OpenAI 兼容分组走 OpenAIGatewayHandler.Messages，
+// 该路径原先只做 "model is required" 检查，thinking/output_config/display/speed 等
+// Anthropic 专有字段在转成 OpenAI chat/completions 时被丢弃，导致非法参数被静默放行
+// （探针观察到 __bogus__ 假枚举、Opus 5 上传 enabled 等都返回 200）。
+// 本组测试锁定：Claude 家族模型在桥接路径上也必须执行官方校验；非 Claude 模型不受影响。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// newBridgeValidationContext 构造 /v1/messages 测试上下文，返回 (ctx, recorder)。
+func newBridgeValidationContext(t *testing.T, body string) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	c.Request.Header.Set("content-type", "application/json")
+	return c, w
+}
+
+func TestIsClaudeFamilyModel(t *testing.T) {
+	cases := map[string]bool{
+		"claude-opus-5":                 true,
+		"claude-sonnet-4-5-20250929":    true,
+		"claude-haiku-4-5":              true,
+		"claude-fable-5-1":              true,
+		"claude-mythos-5":               true,
+		"opus-5":                        true,
+		"sonnet-4-5":                    true,
+		"haiku-4-5":                     true,
+		"gpt-5.6-sol":                   false,
+		"grok-4.3":                      false,
+		"deepseek-v4":                   false,
+		"qwen3.8-27b":                   false,
+		"kimi-k2":                       false,
+		"":                              false,
+	}
+	for model, want := range cases {
+		require.Equal(t, want, isClaudeFamilyModel(model), "model=%q", model)
+	}
+}
+
+func TestValidateAnthropicBridgeRequest_NonClaudeModelPassesThrough(t *testing.T) {
+	// 非 Claude 模型即使带着"非法"的 thinking 参数也应放行（保持既有透传行为）
+	h := &OpenAIGatewayHandler{}
+	body := `{"model":"gpt-5.6-sol","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"__bogus__"}}`
+	c, w := newBridgeValidationContext(t, body)
+	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "gpt-5.6-sol", true))
+	require.Zero(t, w.Body.Len(), "non-claude model must not produce an error response")
+}
+
+func TestValidateAnthropicBridgeRequest_Opus5EnabledRejected(t *testing.T) {
+	// Opus 5 仅自适应：thinking.type=enabled 必须 400（官方明文）
+	h := &OpenAIGatewayHandler{}
+	body := `{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1024}}`
+	c, w := newBridgeValidationContext(t, body)
+	ok := h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true)
+	require.False(t, ok)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	// JSON 序列化会把文案中的引号转义为 \"
+	require.Contains(t, w.Body.String(), `\"thinking.type.enabled\" is not supported for this model`)
+}
+
+func TestValidateAnthropicBridgeRequest_BogusThinkingTypeRejected(t *testing.T) {
+	// 假枚举值 __bogus__ 必须 400（schema 校验底线）
+	h := &OpenAIGatewayHandler{}
+	body := `{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"__bogus_mode_xyz__"}}`
+	c, w := newBridgeValidationContext(t, body)
+	ok := h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true)
+	require.False(t, ok)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), `\"thinking.type\" must be one of`)
+}
+
+func TestValidateAnthropicBridgeRequest_AdaptiveAccepted(t *testing.T) {
+	// 合法 adaptive 应放行
+	h := &OpenAIGatewayHandler{}
+	body := `{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"}}`
+	c, w := newBridgeValidationContext(t, body)
+	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true))
+	require.Zero(t, w.Body.Len())
+}
+
+func TestValidateAnthropicBridgeRequest_SignatureCheckedWhenEnabled(t *testing.T) {
+	// 签名校验默认开：坏签名（非 base64）必须 400
+	repo := &contentModerationHandlerSettingRepo{values: map[string]string{}}
+	h := &OpenAIGatewayHandler{settingService: service.NewSettingService(repo, nil)}
+	sig := "!!!not-valid-base64!!!"
+	body := fmt.Sprintf(`{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":%q}]},{"role":"user","content":"hi"}]}`, sig)
+	c, w := newBridgeValidationContext(t, body)
+	ok := h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true)
+	require.False(t, ok)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "signature is not valid base64")
+}
+
+func TestValidateAnthropicBridgeRequest_SignatureSkippedWhenDisabled(t *testing.T) {
+	// 显式关闭签名校验后，同样的坏签名应放行
+	repo := &contentModerationHandlerSettingRepo{values: map[string]string{
+		service.SettingKeyThinkingSignatureValidation: "false",
+	}}
+	h := &OpenAIGatewayHandler{settingService: service.NewSettingService(repo, nil)}
+	sig := "!!!not-valid-base64!!!"
+	body := fmt.Sprintf(`{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":%q}]},{"role":"user","content":"hi"}]}`, sig)
+	c, w := newBridgeValidationContext(t, body)
+	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true))
+	require.Zero(t, w.Body.Len())
+}
+
+func TestValidateAnthropicBridgeRequest_CountTokensAllowsMissingMaxTokens(t *testing.T) {
+	// count_tokens 路径不要求 max_tokens
+	h := &OpenAIGatewayHandler{}
+	body := `{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`
+	c, w := newBridgeValidationContext(t, body)
+	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", false))
+	require.Zero(t, w.Body.Len())
 }
