@@ -333,6 +333,35 @@ func TestValidateAnthropicRequest_ThinkingDisabledNoBudgetNeeded(t *testing.T) {
 	require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
 }
 
+func TestValidateAnthropicRequest_ThinkingBudgetMustBeBelowMaxTokens(t *testing.T) {
+	// 官方：budget_tokens 必须严格小于 max_tokens（thinking tokens 计入 max_tokens）。
+	// 实测官方原文（claude-opus-4-5-20251101，budget 8192 > max 4096）：
+	//   `max_tokens` must be greater than `thinking.budget_tokens`.
+	body := `{"model": "claude-sonnet-4-5", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 8192}}`
+	err := validateAnthropicRequest([]byte(body), true, "")
+	require.Error(t, err)
+	require.Equal(t, "`max_tokens` must be greater than `thinking.budget_tokens`.", err.Error())
+
+	// 相等也被拒（官方措辞是 "must be greater than"，不含等于）
+	bodyEq := `{"model": "claude-sonnet-4-5", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 4096}}`
+	errEq := validateAnthropicRequest([]byte(bodyEq), true, "")
+	require.Error(t, errEq)
+	require.Equal(t, "`max_tokens` must be greater than `thinking.budget_tokens`.", errEq.Error())
+
+	// 合法：budget < max_tokens
+	bodyOk := `{"model": "claude-sonnet-4-5", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`
+	require.NoError(t, validateAnthropicRequest([]byte(bodyOk), true, ""))
+
+	// 例外：interleaved thinking（携带 interleaved-thinking-2025-05-14 beta 头）
+	// 时 budget 横跨同一 assistant turn 的所有 thinking 块，允许超过 max_tokens
+	require.NoError(t, validateAnthropicRequest([]byte(body), true, "interleaved-thinking-2025-05-14"))
+	require.NoError(t, validateAnthropicRequest([]byte(body), true, "claude-code-20250219, interleaved-thinking-2025-05-14"))
+
+	// count_tokens 不带 max_tokens：无从比较，放行
+	bodyCT := `{"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 8192}}`
+	require.NoError(t, validateAnthropicRequest([]byte(bodyCT), false, ""))
+}
+
 func TestValidateAnthropicRequest_ThinkingInvalidType(t *testing.T) {
 	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "on"}}`
 	err := validateAnthropicRequest([]byte(body), true, "")
@@ -356,7 +385,7 @@ func TestValidateAnthropicRequest_ThinkingDisplayValidValues(t *testing.T) {
 		})
 	}
 	// enabled 模式同样接受 display（官方 ThinkingConfigEnabled 也有 display 字段）
-	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048, "display": "omitted"}}`
+	body := `{"model": "claude-sonnet-4-5", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048, "display": "omitted"}}`
 	require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
 }
 
@@ -413,7 +442,7 @@ func TestValidateAnthropicRequest_Thinking_FableMythos5Series(t *testing.T) {
 			require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
 		})
 		t.Run(model+"_enabled_rejected", func(t *testing.T) {
-			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
 			err := validateAnthropicRequest([]byte(body), true, "")
 			require.Error(t, err)
 			require.Equal(t, `"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
@@ -427,7 +456,7 @@ func TestValidateAnthropicRequest_Thinking_Opus5Disabled(t *testing.T) {
 	require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
 
 	// enabled 仍被拒绝
-	bodyEnabled := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`
+	bodyEnabled := `{"model": "claude-opus-5", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`
 	err := validateAnthropicRequest([]byte(bodyEnabled), true, "")
 	require.Error(t, err)
 	require.Equal(t, `"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
@@ -468,7 +497,7 @@ func TestValidateAnthropicRequest_Thinking_Opus48_Sonnet5(t *testing.T) {
 			require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
 		})
 		t.Run(model+"_enabled_rejected", func(t *testing.T) {
-			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
 			err := validateAnthropicRequest([]byte(body), true, "")
 			require.Error(t, err)
 			require.Equal(t, `"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
@@ -482,7 +511,7 @@ func TestValidateAnthropicRequest_Thinking_MythosPreview(t *testing.T) {
 	bodyAdaptive := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}}`, model)
 	require.NoError(t, validateAnthropicRequest([]byte(bodyAdaptive), true, ""))
 
-	bodyEnabled := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
+	bodyEnabled := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
 	require.NoError(t, validateAnthropicRequest([]byte(bodyEnabled), true, ""))
 
 	bodyDisabled := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`, model)
@@ -497,7 +526,7 @@ func TestValidateAnthropicRequest_Thinking_ExtendedOnlyModels(t *testing.T) {
 	models := []string{"claude-opus-4-5", "claude-haiku-4-5", "claude-sonnet-4-5"}
 	for _, model := range models {
 		t.Run(model+"_enabled_ok", func(t *testing.T) {
-			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
 			require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
 		})
 		t.Run(model+"_disabled_ok", func(t *testing.T) {
@@ -523,7 +552,7 @@ func TestValidateAnthropicRequest_Thinking_UnrestrictedModels(t *testing.T) {
 				if tt == "enabled" {
 					bt = `, "budget_tokens": 2048`
 				}
-				body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "%s"%s}}`, model, tt, bt)
+				body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "%s"%s}}`, model, tt, bt)
 				require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
 			})
 		}
@@ -536,7 +565,7 @@ func TestValidateAnthropicRequest_Thinking_DateSuffixNormalization(t *testing.T)
 	err := validateAnthropicRequest([]byte(body), true, "")
 	require.Error(t, err) // sonnet-4-5 不接受 adaptive
 
-	body2 := `{"model": "claude-sonnet-4-5-20250929", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`
+	body2 := `{"model": "claude-sonnet-4-5-20250929", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`
 	require.NoError(t, validateAnthropicRequest([]byte(body2), true, ""))
 }
 
