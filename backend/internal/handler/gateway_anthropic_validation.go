@@ -332,19 +332,26 @@ func validateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 var allEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
 
 // modelMaxOutputTokens 返回模型的同步 Messages API 最大输出 token 上限。
-// 依据官方 models overview：Fable 5.1 / Opus 5 / Sonnet 5 / Opus 4.7 / 4.8 /
-// Opus 4.6 / Sonnet 4.6 均为 128K；Haiku 4.5 为 64K。未知模型返回 ok=false（放行）。
+// 依据官方各模型页（2026-09-17 逐一核实）：
+//   - 128K：Fable 5.1 / Fable 5 / Mythos 5 / Mythos 5.1 / Opus 5 / Sonnet 5 /
+//     Opus 4.7 / 4.8 / Opus 4.6 / Sonnet 4.6
+//   - 64K：Haiku 4.5 / Opus 4.5 / Sonnet 4.5
+//
+// Mythos 5 官方明言与 Fable 5 共享规格（128K）；mythos-preview 无公开规格页，
+// 保持 fail-open。未知模型返回 ok=false（放行）。
 //
 // 注意：官方文档的 "128K" 是十进制 128000，不是 128*1024=131072。
 // 实测（2026-09-17）：claude-opus-5 传 max_tokens=128001 官方返回 400，
 // 128000 放行。早期实现误用 128*1024 导致 128001~131072 区间被误放行。
 func modelMaxOutputTokens(model string) (int, bool) {
 	switch normalizeThinkingModelFamily(model) {
-	case "claude-fable-5-1", "claude-opus-5", "claude-sonnet-5",
+	case "claude-fable-5-1", "claude-fable-5",
+		"claude-mythos-5-1", "claude-mythos-5",
+		"claude-opus-5", "claude-sonnet-5",
 		"claude-opus-4-8", "claude-opus-4-7",
 		"claude-opus-4-6", "claude-sonnet-4-6":
 		return 128000, true
-	case "claude-haiku-4-5":
+	case "claude-haiku-4-5", "claude-opus-4-5", "claude-sonnet-4-5":
 		return 64000, true
 	}
 	return 0, false
