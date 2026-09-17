@@ -859,7 +859,7 @@ func TestClassifyOpsLocalModelConfigurationRejection(t *testing.T) {
 
 	phase, isBusinessLimited, errorOwner, errorSource := classifyOpsErrorLog(
 		c,
-		"model_not_found",
+		"not_found_error",
 		"Model \"gpt-missing\" is not supported by any configured account in this group",
 		"",
 		http.StatusNotFound,
@@ -881,7 +881,7 @@ func TestClassifyOpsLocalModelConfigurationOverridesStaleUpstreamMarkers(t *test
 		UpstreamStatusCode: http.StatusUnauthorized,
 	}})
 
-	phase, limited, owner, source := classifyOpsErrorLog(c, "model_not_found", "unsupported configured model", "", http.StatusNotFound)
+	phase, limited, owner, source := classifyOpsErrorLog(c, "not_found_error", "unsupported configured model", "", http.StatusNotFound)
 
 	require.Equal(t, "routing", phase)
 	require.True(t, limited)
@@ -925,7 +925,7 @@ func TestOpsErrorLoggerMiddleware_LocalModelConfigurationFields(t *testing.T) {
 		}})
 		c.JSON(http.StatusNotFound, gin.H{
 			"error": gin.H{
-				"type":    "model_not_found",
+				"type":    "not_found_error",
 				"message": "Model \"gpt-missing\" is not supported by any configured account in this group",
 			},
 		})
@@ -936,7 +936,7 @@ func TestOpsErrorLoggerMiddleware_LocalModelConfigurationFields(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusNotFound, w.Code)
-	require.JSONEq(t, `{"error":{"type":"model_not_found","message":"Model \"gpt-missing\" is not supported by any configured account in this group"}}`, w.Body.String())
+	require.JSONEq(t, `{"error":{"type":"not_found_error","message":"Model \"gpt-missing\" is not supported by any configured account in this group"}}`, w.Body.String())
 	job := <-opsErrorLogQueue
 	require.Equal(t, http.StatusNotFound, job.entry.StatusCode)
 	require.Equal(t, "routing", job.entry.ErrorPhase)
@@ -1986,7 +1986,7 @@ func TestClassifyOpsLocalModelConfigurationWithoutIngressMarkStaysRouting(t *tes
 
 	phase, isBusinessLimited, errorOwner, _ := classifyOpsErrorLog(
 		c,
-		"model_not_found",
+		"not_found_error",
 		"Model \"gpt-missing\" is not supported by any configured account in this group",
 		"",
 		http.StatusNotFound,
