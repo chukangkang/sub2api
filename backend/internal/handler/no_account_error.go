@@ -17,10 +17,13 @@ import (
 // account selection failed with ErrNoAvailableAccounts. Handlers obtain it
 // via classifyNoAccountError and choose between:
 //
-//   - 404 model_not_found — the group has accounts, but none of them are
+//   - 404 not_found_error — the group has accounts, but none of them are
 //     configured to serve the requested model (config / typo / unsupported
 //     model). Returning 503 here misleads operators and trips reverse-proxy
 //     health checks; 404 lets the client surface the real problem.
+//     The wire error type is the official Anthropic 404 type
+//     ("not_found_error"); internally this classification is still referred
+//     to as "model not found" (see ModelNotFound).
 //
 //   - 503 api_error — accounts that could serve the model exist but are
 //     temporarily exhausted (rate limit, quota auto-pause, runtime block) OR
@@ -31,7 +34,7 @@ type noAccountErrorClassification struct {
 	Status        int
 	ErrType       string
 	Message       string
-	ModelNotFound bool // true when this is a 404 model_not_found classification
+	ModelNotFound bool // true when this is a 404 not_found_error classification
 }
 
 var selectionModelRateLimitedPattern = regexp.MustCompile(`(?:model_rate_limited|rate_limited)=(\d+)`)
@@ -42,7 +45,7 @@ func classifySelectionFailureError(err error, fallback noAccountErrorClassificat
 	if err == nil {
 		return fallback
 	}
-	// A 404 model_not_found fallback is authoritative and must not be downgraded
+	// A 404 not_found_error fallback is authoritative and must not be downgraded
 	// to a rate-limit verdict. classifyNoAccountError only reaches it through
 	// DiagnoseModelAvailabilityForPlatform, a dedicated database query over
 	// persistent eligibility (active + schedulable + model_mapping) that already
@@ -74,7 +77,7 @@ func classifySelectionFailureError(err error, fallback noAccountErrorClassificat
 	}
 }
 
-// classifyNoAccountError decides between 404 model_not_found and 503
+// classifyNoAccountError decides between 404 not_found_error and 503
 // api_error for "no available accounts" failures.
 //
 // The classifier intentionally does not consume the original error: the
@@ -125,7 +128,10 @@ func classifyNoAccountError(
 	if result.HasAccountsInPool && !result.HasModelSupport {
 		return noAccountErrorClassification{
 			Status:        http.StatusNotFound,
-			ErrType:       "model_not_found",
+			// 与官方 Anthropic 404 错误类型保持一致（not_found_error）。
+			// OpenAI 风格的入口（/v1/chat/completions、/v1/responses 等）也直接透传
+			// 该类型，保证所有入口的 404 报文一致。
+			ErrType:       "not_found_error",
 			Message:       fmt.Sprintf("Model %q is not supported by any configured account in this group", displayModel),
 			ModelNotFound: true,
 		}
