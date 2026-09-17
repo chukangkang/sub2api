@@ -282,10 +282,12 @@ func validateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 	// ── max_tokens: 不得超过模型的最大输出上限 ──
 	// 官方对不同模型有不同的 max_tokens 上限，超过即 400。
 	// 仅对已知上限的模型收紧；未知模型放行交给上游判定。
+	// 错误文案与官方 API 逐字一致（pydantic 风格）：
+	//   'max_tokens': 128001 > 128000 - 'max_tokens' should be smaller than or equal to 128000
 	if mt := gjson.GetBytes(body, "max_tokens"); mt.Exists() && mt.Type == gjson.Number {
 		if n := mt.Int(); n > 0 {
 			if cap, ok := modelMaxOutputTokens(model.Str); ok && n > int64(cap) {
-				return fmt.Errorf(`"max_tokens" must be less than or equal to %d for this model`, cap)
+				return fmt.Errorf(`'max_tokens': %d > %d - 'max_tokens' should be smaller than or equal to %d`, n, cap, cap)
 			}
 		}
 	}
