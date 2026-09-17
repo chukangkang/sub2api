@@ -33,6 +33,18 @@ func (s *SettingService) IsEmailVerifyEnabled(ctx context.Context) bool {
 	return value == "true"
 }
 
+// IsThinkingSignatureValidationEnabled 检查是否对 /v1/messages 请求体中的
+// thinking 块签名做结构校验（非空 + 合法 base64 + 最小解码长度）。
+// 默认开启：设置缺失或查询出错时按开启处理（fail-open 到"校验开"），
+// 仅显式配置 "false" 时关闭。
+func (s *SettingService) IsThinkingSignatureValidationEnabled(ctx context.Context) bool {
+	value, err := s.settingRepo.GetValue(ctx, SettingKeyThinkingSignatureValidation)
+	if err != nil {
+		return true
+	}
+	return value != "false"
+}
+
 // IsRegistrationEmailDomainQuotaEnabled 检查白名单非空时是否放行非白名单域名限量注册。
 // 安全默认：设置缺失或查询出错时按关闭处理（保持白名单严格模式）。
 func (s *SettingService) IsRegistrationEmailDomainQuotaEnabled(ctx context.Context) bool {
