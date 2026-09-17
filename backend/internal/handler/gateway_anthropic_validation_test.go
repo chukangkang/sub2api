@@ -724,6 +724,55 @@ func TestValidateAnthropicRequest_MaxTokensUnknownModelUntouched(t *testing.T) {
 	require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
 }
 
+func TestValidateAnthropicRequest_MaxTokensCapPerModel(t *testing.T) {
+	// 官方各模型页核实的完整上限表（2026-09-17）：
+	// 128K：fable-5-1 / fable-5 / mythos-5-1 / mythos-5 / opus-5 / sonnet-5 /
+	//       opus-4-8 / opus-4-7 / opus-4-6 / sonnet-4-6
+	// 64K ：haiku-4-5 / opus-4-5 / sonnet-4-5
+	// mythos-preview 无公开规格页，保持 fail-open。
+	cases := []struct {
+		model string
+		cap   int
+	}{
+		{"claude-fable-5-1", 128000},
+		{"claude-fable-5", 128000},
+		{"claude-mythos-5-1", 128000},
+		{"claude-mythos-5", 128000},
+		{"claude-opus-5", 128000},
+		{"claude-sonnet-5", 128000},
+		{"claude-opus-4-8", 128000},
+		{"claude-opus-4-7", 128000},
+		{"claude-opus-4-6", 128000},
+		{"claude-sonnet-4-6", 128000},
+		{"claude-haiku-4-5", 64000},
+		{"claude-opus-4-5", 64000},
+		{"claude-sonnet-4-5", 64000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.model+"_"+fmt.Sprint(tc.cap), func(t *testing.T) {
+			above := fmt.Sprintf(`{"model": %q, "max_tokens": %d, "messages": [{"role": "user", "content": "hi"}]}`, tc.model, tc.cap+1)
+			err := validateAnthropicRequest([]byte(above), true, "")
+			require.Error(t, err)
+			require.Equal(t,
+				fmt.Sprintf(`'max_tokens': %d > %d - 'max_tokens' should be smaller than or equal to %d`, tc.cap+1, tc.cap, tc.cap),
+				err.Error())
+
+			atCap := fmt.Sprintf(`{"model": %q, "max_tokens": %d, "messages": [{"role": "user", "content": "hi"}]}`, tc.model, tc.cap)
+			require.NoError(t, validateAnthropicRequest([]byte(atCap), true, ""), "cap 本身应放行")
+		})
+	}
+
+	// 带日期后缀的快照 ID 也应命中同一上限
+	dated := `{"model": "claude-sonnet-4-5-20250929", "max_tokens": 64001, "messages": [{"role": "user", "content": "hi"}]}`
+	err := validateAnthropicRequest([]byte(dated), true, "")
+	require.Error(t, err)
+	require.Equal(t, `'max_tokens': 64001 > 64000 - 'max_tokens' should be smaller than or equal to 64000`, err.Error())
+
+	// mythos-preview：无公开规格，fail-open
+	unspecified := `{"model": "claude-mythos-preview", "max_tokens": 999999, "messages": [{"role": "user", "content": "hi"}]}`
+	require.NoError(t, validateAnthropicRequest([]byte(unspecified), true, ""))
+}
+
 // ── output_config.effort 校验 ──
 
 func TestValidateAnthropicRequest_EffortInvalidValueRejected(t *testing.T) {
