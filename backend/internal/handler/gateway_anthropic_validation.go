@@ -6,6 +6,7 @@ package handler
 // 400 + invalid_request_error 响应给客户端。
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,6 +15,77 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 )
+
+// thinkingSignatureMinDecodedLen 是 thinking 块签名解码后的最小字节数阈值。
+// 真实的 Anthropic thinking 签名是一段较长的不透明 base64（解码后数百~数千字节）；
+// 明显偏短的签名通常是截断/损坏。取 32 字节作为下限：既能拦住明显的坏签名，
+// 又不会误伤合法的较短签名。
+const thinkingSignatureMinDecodedLen = 32
+
+// validateThinkingSignatures 对请求体中 assistant 消息里的 thinking /
+// redacted_thinking 块做签名结构校验。
+//
+// 背景：上游（尤其经 New-API 等中转的 Opus 5 链路）普遍不校验 thinking 签名
+// 的内容，坏签名会被照单全收。为了让本网关自守门，这里在转发前主动把关：
+//   - signature 字段缺失或为空串：放行（交由既有的预过滤/整流逻辑处理，
+//     那些路径专门负责"缺签名"场景，避免在此重复拦截）。
+//   - signature 存在且非空：必须是合法 base64，且解码后不少于
+//     thinkingSignatureMinDecodedLen 字节，否则返回 400 风格错误。
+//
+// 该检查是纯结构性的：它只能识别"格式坏了"的签名（空/截断/乱码/非 base64），
+// 无法识别"格式合法但内容被篡改"的签名（网关没有 Anthropic 密钥，做不了密码学
+// 验签）。因此对"上游每轮签发新签名"这一正常情形天然免疫——只要新签名格式合法
+// 就会放行，不会因为"和上一次不一样"而被误杀。
+func validateThinkingSignatures(body []byte) error {
+	msgs := gjson.GetBytes(body, "messages")
+	if !msgs.IsArray() {
+		return nil
+	}
+	for mi, m := range msgs.Array() {
+		if m.Get("role").Str != "assistant" {
+			continue
+		}
+		content := m.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for bi, block := range content.Array() {
+			btype := block.Get("type").Str
+			if btype != "thinking" && btype != "redacted_thinking" {
+				continue
+			}
+			sig := block.Get("signature")
+			if !sig.Exists() || sig.Type != gjson.String || sig.Str == "" {
+				continue
+			}
+			if err := checkThinkingSignatureFormat(sig.Str); err != nil {
+				return fmt.Errorf("messages.%d.content.%d: %v", mi, bi, err)
+			}
+		}
+	}
+	return nil
+}
+
+// checkThinkingSignatureFormat 校验单个签名字符串的结构合法性。
+// 错误文案对齐官方 "Invalid `signature` in `thinking` block" 的风格。
+func checkThinkingSignatureFormat(sig string) error {
+	const badBase64 = "Invalid `signature` in `thinking` block: signature is not valid base64"
+	const tooShort = "Invalid `signature` in `thinking` block: signature is too short"
+
+	decoded, err := base64.StdEncoding.DecodeString(sig)
+	if err != nil {
+		// 兼容 URL-safe base64（个别客户端/上游可能使用）
+		if decoded2, err2 := base64.URLEncoding.DecodeString(sig); err2 == nil {
+			decoded = decoded2
+		} else {
+			return errors.New(badBase64)
+		}
+	}
+	if len(decoded) < thinkingSignatureMinDecodedLen {
+		return errors.New(tooShort)
+	}
+	return nil
+}
 
 // validateAnthropicRequest 校验 Anthropic Messages API 请求体。
 // requireMaxTokens 控制是否要求 max_tokens 字段（/v1/messages 为 true，

@@ -788,3 +788,79 @@ func TestValidateAnthropicRequest_SpeedStandardAlwaysAccepted(t *testing.T) {
 	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "speed": "standard"}`
 	require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
 }
+
+// ── thinking 块签名结构校验 ──
+
+// longValidSig 是一个合法 base64、解码后远超最小长度的签名（模拟真实签名）。
+const longValidSig = "CAISuyMKpgEIERgCKkCozyv1jDNFSU1VkqYoVveGjyGIeEuG7iAuUN2RtIb6MXhssIMBOlwsr+v0knDmsgp7nWdfdTC7"
+
+func TestValidateThinkingSignatures_ValidSignatureAccepted(t *testing.T) {
+	body := fmt.Sprintf(`{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
+		{"role": "user", "content": "hi"}
+	]}`, longValidSig)
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
+}
+
+func TestValidateThinkingSignatures_NonBase64Rejected(t *testing.T) {
+	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "!!!not-base64$$$"}]},
+		{"role": "user", "content": "hi"}
+	]}`
+	err := validateThinkingSignatures([]byte(body))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "messages.0.content.0")
+	require.Contains(t, err.Error(), "not valid base64")
+}
+
+func TestValidateThinkingSignatures_TooShortRejected(t *testing.T) {
+	// "AAAA" 是合法 base64，但解码后仅 3 字节 < 32
+	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "AAAA"}]},
+		{"role": "user", "content": "hi"}
+	]}`
+	err := validateThinkingSignatures([]byte(body))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "too short")
+}
+
+func TestValidateThinkingSignatures_EmptySignatureSkipped(t *testing.T) {
+	// 空签名交给既有预过滤/整流逻辑，此处不拦
+	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": ""}]},
+		{"role": "user", "content": "hi"}
+	]}`
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
+}
+
+func TestValidateThinkingSignatures_MissingSignatureSkipped(t *testing.T) {
+	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"}]},
+		{"role": "user", "content": "hi"}
+	]}`
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
+}
+
+func TestValidateThinkingSignatures_UserMessageIgnored(t *testing.T) {
+	// 只有 assistant 消息的 thinking 块参与校验；user 消息里的块不看
+	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "user", "content": [{"type": "thinking", "thinking": "hmm", "signature": "AAA"}]},
+		{"role": "user", "content": "hi"}
+	]}`
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
+}
+
+func TestValidateThinkingSignatures_RedactedThinkingChecked(t *testing.T) {
+	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "redacted_thinking", "signature": "!!!bad$$$"}]},
+		{"role": "user", "content": "hi"}
+	]}`
+	err := validateThinkingSignatures([]byte(body))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not valid base64")
+}
+
+func TestValidateThinkingSignatures_NoAssistantMessages(t *testing.T) {
+	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}`
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
+}

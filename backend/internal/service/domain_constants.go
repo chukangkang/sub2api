@@ -636,6 +636,12 @@ const (
 	// SettingKeyMaxClaudeCodeVersion 最高 Claude Code 版本号限制 (semver, 如 "3.0.0"，空值=不检查)
 	SettingKeyMaxClaudeCodeVersion = "max_claude_code_version"
 
+	// SettingKeyThinkingSignatureValidation /v1/messages 请求体中 thinking 块签名的结构校验开关。
+	// 默认开启（未设置或查询失败均按开启处理）；仅显式 "false" 关闭。
+	// 校验规则：assistant 消息中 thinking/redacted_thinking 块的 signature 字段若存在且非空，
+	// 必须是合法 base64 且解码后不少于最小长度，否则 400（上游多数链路不验签，网关自守门）。
+	SettingKeyThinkingSignatureValidation = "thinking_signature_validation"
+
 	// SettingKeyAllowUngroupedKeyScheduling 允许未分组 API Key 调度（默认 false：未分组 Key 返回 403）
 	SettingKeyAllowUngroupedKeyScheduling = "allow_ungrouped_key_scheduling"
 	// SettingKeyOpenAILowUpstreamRatePriorityEnabled 旧调度是否按上游 token 倍率优先。
