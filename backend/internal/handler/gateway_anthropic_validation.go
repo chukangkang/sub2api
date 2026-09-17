@@ -332,14 +332,18 @@ var allEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
 // modelMaxOutputTokens 返回模型的同步 Messages API 最大输出 token 上限。
 // 依据官方 models overview：Fable 5.1 / Opus 5 / Sonnet 5 / Opus 4.7 / 4.8 /
 // Opus 4.6 / Sonnet 4.6 均为 128K；Haiku 4.5 为 64K。未知模型返回 ok=false（放行）。
+//
+// 注意：官方文档的 "128K" 是十进制 128000，不是 128*1024=131072。
+// 实测（2026-09-17）：claude-opus-5 传 max_tokens=128001 官方返回 400，
+// 128000 放行。早期实现误用 128*1024 导致 128001~131072 区间被误放行。
 func modelMaxOutputTokens(model string) (int, bool) {
 	switch normalizeThinkingModelFamily(model) {
 	case "claude-fable-5-1", "claude-opus-5", "claude-sonnet-5",
 		"claude-opus-4-8", "claude-opus-4-7",
 		"claude-opus-4-6", "claude-sonnet-4-6":
-		return 128 * 1024, true
+		return 128000, true
 	case "claude-haiku-4-5":
-		return 64 * 1024, true
+		return 64000, true
 	}
 	return 0, false
 }
