@@ -57,7 +57,7 @@ func TestGatewayRoutesPinnedModelsDispatchesOrdinaryAndCodexRequests(t *testing.
 		nil, nil, nil, nil, nil, upstream, nil, nil, nil, nil, nil, nil, nil, nil)
 	h := &handler.Handlers{
 		Gateway:       handler.NewGatewayHandler(nil, s, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, cfg, nil),
-		OpenAIGateway: handler.NewOpenAIGatewayHandler(s, nil, nil, nil, nil, nil, nil, nil, cfg),
+		OpenAIGateway: handler.NewOpenAIGatewayHandler(s, nil, nil, nil, nil, nil, nil, nil, cfg, nil),
 		AsyncImage:    handler.NewAsyncImageHandler(nil, nil),
 	}
 	group := &service.Group{ID: 1, Platform: service.PlatformOpenAI,
@@ -106,7 +106,7 @@ func TestGatewayRoutesRetrievePinnedModel(t *testing.T) {
 		nil, nil, nil, nil, nil, upstream, nil, nil, nil, nil, nil, nil, nil, nil)
 	h := &handler.Handlers{
 		Gateway:       handler.NewGatewayHandler(nil, s, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, cfg, nil),
-		OpenAIGateway: handler.NewOpenAIGatewayHandler(s, nil, nil, nil, nil, nil, nil, nil, cfg),
+		OpenAIGateway: handler.NewOpenAIGatewayHandler(s, nil, nil, nil, nil, nil, nil, nil, cfg, nil),
 		AsyncImage:    handler.NewAsyncImageHandler(nil, nil),
 	}
 	group := &service.Group{ID: 1, Platform: service.PlatformOpenAI,
