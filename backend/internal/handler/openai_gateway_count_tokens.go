@@ -231,6 +231,12 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 	}
 
 	reqModel := parsedReq.Model
+
+	// 与 Messages 一致：Claude 家族模型做官方参数校验（count_tokens 不要求 max_tokens）。
+	if !h.validateAnthropicBridgeRequest(c, body, reqModel, false) {
+		return
+	}
+
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	// composite+grok 在路由层已分流到 GrokCountTokens，这里可达的目标平台是
 	// openai 与 CN 供应商；CN 账号由 ForwardCountTokensAsAnthropic 本地估算。

@@ -16,6 +16,19 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 )
 
+// isClaudeFamilyModel 判断请求的模型是否属于 Claude 家族
+// （claude-* / opus-* / sonnet-* / haiku-*）。
+// OpenAI 桥接路径（/v1/messages 经 OpenAI 兼容分组转发）只对 Claude 模型
+// 应用官方 Anthropic 校验；其他模型（grok / deepseek / qwen 等）保持既有
+// 透传行为，避免误伤。
+func isClaudeFamilyModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "claude") ||
+		strings.HasPrefix(m, "opus") ||
+		strings.HasPrefix(m, "sonnet") ||
+		strings.HasPrefix(m, "haiku")
+}
+
 // thinkingSignatureMinDecodedLen 是 thinking 块签名解码后的最小字节数阈值。
 // 真实的 Anthropic thinking 签名是一段较长的不透明 base64（解码后数百~数千字节）；
 // 明显偏短的签名通常是截断/损坏。取 32 字节作为下限：既能拦住明显的坏签名，
