@@ -4,7 +4,11 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"log"
@@ -31,11 +35,26 @@ var embeddedVersion string
 
 // Build-time variables (can be set by ldflags)
 var (
-	Version   = ""
-	Commit    = "unknown"
-	Date      = "unknown"
-	BuildType = "source" // "source" for manual builds, "release" for CI builds (set by ldflags)
+	Version          = ""
+	Commit           = "unknown"
+	Date             = "unknown"
+	BuildType        = "source" // "source" for manual builds, "release" for CI builds (set by ldflags)
+	LicensePublicKey = ""
 )
+
+const (
+	machineCodePrefix = "mc1."
+	licensePrefix     = "lic1."
+	machineCodeSalt   = "sub2api-machine-code-salt-v1\n"
+	licenseMessage    = "sub2api-license-v1\n"
+)
+
+type licenseIdentity struct {
+	hostname    string
+	machineID   string
+	productUUID string
+	boardSerial string
+}
 
 func init() {
 	// 如果 Version 已通过 ldflags 注入（例如 -X main.Version=...），则不要覆盖。
@@ -59,10 +78,25 @@ func main() {
 	// Parse command line flags
 	setupMode := flag.Bool("setup", false, "Run setup wizard in CLI mode")
 	showVersion := flag.Bool("version", false, "Show version information")
+	serialNumber := flag.String("sn", "", "License serial number")
 	flag.Parse()
 
 	if *showVersion {
 		log.Printf("Sub2API %s (commit: %s, built: %s)\n", Version, Commit, Date)
+		return
+	}
+
+	if strings.TrimSpace(*serialNumber) == "" {
+		log.Print("License serial number is required")
+		return
+	}
+	valid, err := verifyLicense(*serialNumber)
+	if err != nil {
+		log.Printf("License verification failed: %v", err)
+		return
+	}
+	if !valid {
+		log.Print("License verification failed")
 		return
 	}
 
@@ -92,6 +126,121 @@ func main() {
 
 	// Normal server mode
 	runMainServer()
+}
+
+func verifyLicense(serialNumber string) (bool, error) {
+	identity, err := collectLicenseIdentity()
+	if err != nil {
+		return false, err
+	}
+
+	encodedPublicKey := strings.TrimSpace(LicensePublicKey)
+	if encodedPublicKey == "" {
+		return false, errors.New("license public key is not configured")
+	}
+	publicKey, err := base64.RawURLEncoding.Strict().DecodeString(encodedPublicKey)
+	if err != nil || len(publicKey) != ed25519.PublicKeySize {
+		return false, errors.New("license public key is invalid")
+	}
+
+	serialNumber = strings.TrimSpace(serialNumber)
+	if !strings.HasPrefix(serialNumber, licensePrefix) {
+		return false, errors.New("license serial number has an invalid format")
+	}
+	signature, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(serialNumber, licensePrefix))
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return false, errors.New("license serial number has an invalid format")
+	}
+
+	machineCode := calculateMachineCode(identity)
+	message := []byte(licenseMessage + machineCode)
+	return ed25519.Verify(ed25519.PublicKey(publicKey), message, signature), nil
+}
+
+func collectLicenseIdentity() (licenseIdentity, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = ""
+	}
+
+	identity := licenseIdentity{
+		hostname: hostname,
+		machineID: readFirstIdentityFile(
+			"/etc/machine-id",
+			"/var/lib/dbus/machine-id",
+		),
+		productUUID: readIdentityFile("/sys/class/dmi/id/product_uuid"),
+		boardSerial: readIdentityFile("/sys/class/dmi/id/board_serial"),
+	}
+	if normalizeLicenseValue(identity.hostname) == "" &&
+		normalizeLicenseValue(identity.machineID) == "" &&
+		normalizeLicenseValue(identity.productUUID) == "" &&
+		normalizeLicenseValue(identity.boardSerial) == "" {
+		return licenseIdentity{}, errors.New("no usable machine identity was found")
+	}
+	return identity, nil
+}
+
+func readFirstIdentityFile(paths ...string) string {
+	for _, path := range paths {
+		value := readIdentityFile(path)
+		if normalizeLicenseValue(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func readIdentityFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func calculateMachineCode(identity licenseIdentity) string {
+	digest := sha256.Sum256([]byte(machineCodeSalt + identity.canonical()))
+	return machineCodePrefix + hex.EncodeToString(digest[:])
+}
+
+func (identity licenseIdentity) canonical() string {
+	return "sub2api-machine-v1\n" +
+		"hostname=" + normalizeLicenseValue(identity.hostname) + "\n" +
+		"machine-id=" + normalizeLicenseValue(identity.machineID) + "\n" +
+		"product-uuid=" + normalizeLicenseValue(identity.productUUID) + "\n" +
+		"board-serial=" + normalizeLicenseValue(identity.boardSerial) + "\n"
+}
+
+func normalizeLicenseValue(value string) string {
+	var builder strings.Builder
+	builder.Grow(len(value))
+	space := false
+	for i := 0; i < len(value); i++ {
+		character := value[i]
+		if isASCIISpace(character) {
+			space = builder.Len() > 0
+			continue
+		}
+		if space {
+			builder.WriteByte(' ')
+			space = false
+		}
+		if character >= 'A' && character <= 'Z' {
+			character += 'a' - 'A'
+		}
+		builder.WriteByte(character)
+	}
+	return builder.String()
+}
+
+func isASCIISpace(character byte) bool {
+	switch character {
+	case ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	default:
+		return false
+	}
 }
 
 func runSetupServer() {
