@@ -4,10 +4,7 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"crypto/ed25519"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
@@ -16,7 +13,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,8 +29,6 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/web"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/go-tpm/tpm2"
-	"github.com/google/go-tpm/tpm2/transport"
 )
 
 //go:embed VERSION
@@ -50,20 +44,19 @@ var (
 )
 
 const (
-	machineCodePrefix           = "mc1."
-	licensePrefix               = "lic1."
-	machineCodeSalt             = "sub2api-machine-code-salt-v1\n"
-	licenseMessage              = "sub2api-license-v1\n"
-	tpmProofMessage             = "sub2api-tpm-proof-v1\n"
-	licenseTPMPersistentHandle  = tpm2.TPMHandle(0x81015342)
-	licenseTPMPublicPointLength = 1 + 2*32
+	machineCodePrefix = "mc1."
+	licensePrefix     = "lic1."
+	machineCodeSalt   = "sub2api-machine-code-salt-v1\n"
+	licenseMessage    = "sub2api-license-v1\n"
 )
 
 type licenseIdentity struct {
-	hostname    string
-	machineID   string
-	productUUID string
-	boardSerial string
+	hostname      string
+	machineID     string
+	productUUID   string
+	productSerial string
+	boardSerial   string
+	chassisSerial string
 }
 
 func init() {
@@ -173,22 +166,10 @@ func verifyLicense(serialNumber string) (bool, error) {
 		return false, errors.New("license serial number has an invalid format")
 	}
 
-	tpm, handle, name, tpmPublicKey, err := openLicenseTPM(false)
-	if err != nil {
-		return false, err
-	}
-	defer tpm.Close()
-
-	machineCode, err := calculateTPMMachineCode(identity, tpmPublicKey)
-	if err != nil {
-		return false, err
-	}
+	machineCode := calculateMachineCode(identity)
 	message := []byte(licenseMessage + machineCode)
 	if !ed25519.Verify(ed25519.PublicKey(publicKey), message, signature) {
 		return false, nil
-	}
-	if err := proveLicenseTPM(tpm, handle, name, tpmPublicKey); err != nil {
-		return false, err
 	}
 	return true, nil
 }
@@ -198,162 +179,7 @@ func registrationMachineCode() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	tpm, _, _, publicKey, err := openLicenseTPM(true)
-	if err != nil {
-		return "", err
-	}
-	defer tpm.Close()
-
-	machineCode, err := calculateTPMMachineCode(identity, publicKey)
-	if err != nil {
-		return "", err
-	}
-	return machineCode, nil
-}
-
-func openLicenseTPM(createIfMissing bool) (transport.TPMCloser, tpm2.TPMHandle, tpm2.TPM2BName, *ecdsa.PublicKey, error) {
-	tpm, err := transport.OpenTPM()
-	if err != nil {
-		return nil, 0, tpm2.TPM2BName{}, nil, errors.New("TPM is unavailable")
-	}
-
-	read := tpm2.ReadPublic{ObjectHandle: licenseTPMPersistentHandle}
-	response, readErr := read.Execute(tpm)
-	if readErr == nil {
-		publicKey, err := licenseTPMECDSAPublicKey(response.OutPublic)
-		if err != nil {
-			tpm.Close()
-			return nil, 0, tpm2.TPM2BName{}, nil, errors.New("TPM license key is incompatible")
-		}
-		return tpm, licenseTPMPersistentHandle, response.Name, publicKey, nil
-	}
-	if !createIfMissing || !errors.Is(readErr, tpm2.TPMRCHandle) {
-		tpm.Close()
-		return nil, 0, tpm2.TPM2BName{}, nil, errors.New("TPM license key is unavailable")
-	}
-
-	created, err := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.TPMRHOwner,
-		InPublic: tpm2.New2B(tpm2.TPMTPublic{
-			Type:    tpm2.TPMAlgECC,
-			NameAlg: tpm2.TPMAlgSHA256,
-			ObjectAttributes: tpm2.TPMAObject{
-				FixedTPM:            true,
-				FixedParent:         true,
-				SensitiveDataOrigin: true,
-				UserWithAuth:        true,
-				NoDA:                true,
-				SignEncrypt:         true,
-			},
-			Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgECC, &tpm2.TPMSECCParms{
-				Scheme: tpm2.TPMTECCScheme{
-					Scheme: tpm2.TPMAlgECDSA,
-					Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgECDSA, &tpm2.TPMSSigSchemeECDSA{
-						HashAlg: tpm2.TPMAlgSHA256,
-					}),
-				},
-				CurveID: tpm2.TPMECCNistP256,
-			}),
-		}),
-	}.Execute(tpm, tpm2.PasswordAuth(nil))
-	if err != nil {
-		tpm.Close()
-		return nil, 0, tpm2.TPM2BName{}, nil, errors.New("unable to create TPM license key")
-	}
-	flushTransient := func() error {
-		_, err := tpm2.FlushContext{FlushHandle: created.ObjectHandle}.Execute(tpm)
-		return err
-	}
-
-	publicKey, err := licenseTPMECDSAPublicKey(created.OutPublic)
-	if err != nil {
-		_ = flushTransient()
-		tpm.Close()
-		return nil, 0, tpm2.TPM2BName{}, nil, errors.New("TPM license key is incompatible")
-	}
-
-	_, err = tpm2.EvictControl{
-		Auth: tpm2.TPMRHOwner,
-		ObjectHandle: &tpm2.NamedHandle{
-			Handle: created.ObjectHandle,
-			Name:   created.Name,
-		},
-		PersistentHandle: licenseTPMPersistentHandle,
-	}.Execute(tpm, tpm2.PasswordAuth(nil))
-	if err != nil {
-		_ = flushTransient()
-		tpm.Close()
-		return nil, 0, tpm2.TPM2BName{}, nil, errors.New("unable to persist TPM license key")
-	}
-	if err := flushTransient(); err != nil {
-		tpm.Close()
-		return nil, 0, tpm2.TPM2BName{}, nil, errors.New("unable to finalize TPM license key")
-	}
-
-	return tpm, licenseTPMPersistentHandle, created.Name, publicKey, nil
-}
-
-func licenseTPMECDSAPublicKey(public tpm2.TPM2BPublic) (*ecdsa.PublicKey, error) {
-	contents, err := public.Contents()
-	if err != nil || contents.Type != tpm2.TPMAlgECC || contents.NameAlg != tpm2.TPMAlgSHA256 {
-		return nil, errors.New("invalid TPM public area")
-	}
-	attributes := contents.ObjectAttributes
-	if !attributes.FixedTPM || !attributes.FixedParent || !attributes.SensitiveDataOrigin ||
-		!attributes.UserWithAuth || !attributes.NoDA || !attributes.SignEncrypt ||
-		attributes.Restricted || attributes.Decrypt {
-		return nil, errors.New("invalid TPM object attributes")
-	}
-	parameters, err := contents.Parameters.ECCDetail()
-	if err != nil || parameters.CurveID != tpm2.TPMECCNistP256 || parameters.Scheme.Scheme != tpm2.TPMAlgECDSA {
-		return nil, errors.New("invalid TPM ECC parameters")
-	}
-	scheme, err := parameters.Scheme.Details.ECDSA()
-	if err != nil || scheme.HashAlg != tpm2.TPMAlgSHA256 {
-		return nil, errors.New("invalid TPM ECDSA scheme")
-	}
-	point, err := contents.Unique.ECC()
-	if err != nil || len(point.X.Buffer) == 0 || len(point.Y.Buffer) == 0 {
-		return nil, errors.New("invalid TPM ECC public point")
-	}
-	publicKey, err := tpm2.ECDSAPub(parameters, point)
-	if err != nil || publicKey.Curve != elliptic.P256() || !publicKey.Curve.IsOnCurve(publicKey.X, publicKey.Y) {
-		return nil, errors.New("invalid TPM ECC public point")
-	}
-	return publicKey, nil
-}
-
-func proveLicenseTPM(tpm transport.TPM, handle tpm2.TPMHandle, name tpm2.TPM2BName, publicKey *ecdsa.PublicKey) error {
-	challenge := make([]byte, 32)
-	if _, err := rand.Read(challenge); err != nil {
-		return errors.New("unable to create TPM challenge")
-	}
-	digest := sha256.Sum256(append([]byte(tpmProofMessage), challenge...))
-	response, err := tpm2.Sign{
-		KeyHandle: tpm2.NamedHandle{Handle: handle, Name: name},
-		Digest:    tpm2.TPM2BDigest{Buffer: digest[:]},
-		InScheme: tpm2.TPMTSigScheme{
-			Scheme: tpm2.TPMAlgECDSA,
-			Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgECDSA, &tpm2.TPMSSchemeHash{
-				HashAlg: tpm2.TPMAlgSHA256,
-			}),
-		},
-		Validation: tpm2.TPMTTKHashCheck{
-			Tag:       tpm2.TPMSTHashCheck,
-			Hierarchy: tpm2.TPMRHNull,
-		},
-	}.Execute(tpm, tpm2.PasswordAuth(nil))
-	if err != nil {
-		return errors.New("TPM license proof failed")
-	}
-	ecdsaSignature, err := response.Signature.Signature.ECDSA()
-	if err != nil || len(ecdsaSignature.SignatureR.Buffer) == 0 || len(ecdsaSignature.SignatureS.Buffer) == 0 {
-		return errors.New("TPM license proof is invalid")
-	}
-	if !ecdsa.Verify(publicKey, digest[:], new(big.Int).SetBytes(ecdsaSignature.SignatureR.Buffer), new(big.Int).SetBytes(ecdsaSignature.SignatureS.Buffer)) {
-		return errors.New("TPM license proof is invalid")
-	}
-	return nil
+	return calculateMachineCode(identity), nil
 }
 
 func collectLicenseIdentity() (licenseIdentity, error) {
@@ -368,13 +194,17 @@ func collectLicenseIdentity() (licenseIdentity, error) {
 			"/etc/machine-id",
 			"/var/lib/dbus/machine-id",
 		),
-		productUUID: readIdentityFile("/sys/class/dmi/id/product_uuid"),
-		boardSerial: readIdentityFile("/sys/class/dmi/id/board_serial"),
+		productUUID:   readIdentityFile("/sys/class/dmi/id/product_uuid"),
+		productSerial: readIdentityFile("/sys/class/dmi/id/product_serial"),
+		boardSerial:   readIdentityFile("/sys/class/dmi/id/board_serial"),
+		chassisSerial: readIdentityFile("/sys/class/dmi/id/chassis_serial"),
 	}
 	if normalizeLicenseValue(identity.hostname) == "" &&
 		normalizeLicenseValue(identity.machineID) == "" &&
 		normalizeLicenseValue(identity.productUUID) == "" &&
-		normalizeLicenseValue(identity.boardSerial) == "" {
+		normalizeLicenseValue(identity.productSerial) == "" &&
+		normalizeLicenseValue(identity.boardSerial) == "" &&
+		normalizeLicenseValue(identity.chassisSerial) == "" {
 		return licenseIdentity{}, errors.New("no usable machine identity was found")
 	}
 	return identity, nil
@@ -398,18 +228,9 @@ func readIdentityFile(path string) string {
 	return string(data)
 }
 
-func calculateTPMMachineCode(identity licenseIdentity, publicKey *ecdsa.PublicKey) (string, error) {
-	if publicKey == nil || publicKey.X == nil || publicKey.Y == nil || publicKey.Curve != elliptic.P256() ||
-		!publicKey.Curve.IsOnCurve(publicKey.X, publicKey.Y) {
-		return "", errors.New("TPM license key is incompatible")
-	}
-	point := elliptic.Marshal(elliptic.P256(), publicKey.X, publicKey.Y)
-	if len(point) != licenseTPMPublicPointLength {
-		return "", errors.New("TPM license key is incompatible")
-	}
-	payload := machineCodeSalt + identity.canonical() + "tpm-public-point=" + hex.EncodeToString(point) + "\n"
-	digest := sha256.Sum256([]byte(payload))
-	return machineCodePrefix + hex.EncodeToString(digest[:]), nil
+func calculateMachineCode(identity licenseIdentity) string {
+	digest := sha256.Sum256([]byte(machineCodeSalt + identity.canonical()))
+	return machineCodePrefix + hex.EncodeToString(digest[:])
 }
 
 func (identity licenseIdentity) canonical() string {
@@ -417,7 +238,9 @@ func (identity licenseIdentity) canonical() string {
 		"hostname=" + normalizeLicenseValue(identity.hostname) + "\n" +
 		"machine-id=" + normalizeLicenseValue(identity.machineID) + "\n" +
 		"product-uuid=" + normalizeLicenseValue(identity.productUUID) + "\n" +
-		"board-serial=" + normalizeLicenseValue(identity.boardSerial) + "\n"
+		"product-serial=" + normalizeLicenseValue(identity.productSerial) + "\n" +
+		"board-serial=" + normalizeLicenseValue(identity.boardSerial) + "\n" +
+		"chassis-serial=" + normalizeLicenseValue(identity.chassisSerial) + "\n"
 }
 
 func normalizeLicenseValue(value string) string {
