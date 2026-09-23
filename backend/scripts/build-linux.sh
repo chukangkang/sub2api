@@ -12,6 +12,26 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."   # -> backend/
 
+# ---- Go 环境自检（WSL 中装在 ~/go，见 docs/FORK_SYNC_WORKFLOW.md §5）----
+if ! command -v go >/dev/null 2>&1; then
+  for cand in "$HOME/go/bin" /usr/local/go/bin /usr/lib/go/bin; do
+    if [ -x "$cand/go" ]; then
+      export PATH="$cand:$PATH"
+      break
+    fi
+  done
+fi
+if ! command -v go >/dev/null 2>&1; then
+  echo "ERROR: 未找到 go。WSL 中安装:" >&2
+  echo "  curl -fsSL -o /tmp/go.tgz https://mirrors.aliyun.com/golang/go1.27.0.linux-amd64.tar.gz && tar -xzf /tmp/go.tgz -C \$HOME" >&2
+  exit 1
+fi
+export GOPATH=${GOPATH:-"$HOME/.gopath"}
+export GOPROXY=${GOPROXY:-https://goproxy.cn,direct}
+export CGO_ENABLED=0
+
+echo "[env] $(go version) | GOPROXY=$GOPROXY"
+
 VERSION=${VERSION:-$(./scripts/resolve-version.sh)}
 LICENSE_PUBLIC_KEY=${LICENSE_PUBLIC_KEY:-"qnmdBw9L6pEU7QLuiHvbDk-va7XOLDdljDjVGUOJr-M"}   # 64字节公钥
 OUT=${OUT:-bin/sub2api}
