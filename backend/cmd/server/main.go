@@ -187,22 +187,13 @@ func collectLicenseIdentity() (licenseIdentity, error) {
 		hostname = ""
 	}
 
-	productUUID, err := readRequiredDMIValue("/sys/class/dmi/id/product_uuid")
-	if err != nil {
-		return licenseIdentity{}, err
-	}
-	productSerial, err := readRequiredDMIValue("/sys/class/dmi/id/product_serial")
-	if err != nil {
-		return licenseIdentity{}, err
-	}
-	boardSerial, err := readRequiredDMIValue("/sys/class/dmi/id/board_serial")
-	if err != nil {
-		return licenseIdentity{}, err
-	}
-	chassisSerial, err := readRequiredDMIValue("/sys/class/dmi/id/chassis_serial")
-	if err != nil {
-		return licenseIdentity{}, err
-	}
+	// DMI values degrade gracefully: containers (e.g. Docker Desktop on WSL2)
+	// expose empty /sys/class/dmi/id entries, so missing values fall back to
+	// the remaining identity sources instead of failing outright.
+	productUUID := readIdentityFile("/sys/class/dmi/id/product_uuid")
+	productSerial := readIdentityFile("/sys/class/dmi/id/product_serial")
+	boardSerial := readIdentityFile("/sys/class/dmi/id/board_serial")
+	chassisSerial := readIdentityFile("/sys/class/dmi/id/chassis_serial")
 
 	identity := licenseIdentity{
 		hostname:      hostname,
@@ -211,6 +202,14 @@ func collectLicenseIdentity() (licenseIdentity, error) {
 		productSerial: productSerial,
 		boardSerial:   boardSerial,
 		chassisSerial: chassisSerial,
+	}
+	if normalizeLicenseValue(identity.hostname) == "" &&
+		normalizeLicenseValue(identity.machineID) == "" &&
+		normalizeLicenseValue(identity.productUUID) == "" &&
+		normalizeLicenseValue(identity.productSerial) == "" &&
+		normalizeLicenseValue(identity.boardSerial) == "" &&
+		normalizeLicenseValue(identity.chassisSerial) == "" {
+		return licenseIdentity{}, errors.New("no usable machine identity was found")
 	}
 	return identity, nil
 }
@@ -231,14 +230,6 @@ func readIdentityFile(path string) string {
 		return ""
 	}
 	return string(data)
-}
-
-func readRequiredDMIValue(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil || normalizeLicenseValue(string(data)) == "" {
-		return "", errors.New("required machine identity is unavailable")
-	}
-	return string(data), nil
 }
 
 func calculateMachineCode(identity licenseIdentity) string {
