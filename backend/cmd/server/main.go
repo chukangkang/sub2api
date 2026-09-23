@@ -187,13 +187,15 @@ func collectLicenseIdentity() (licenseIdentity, error) {
 		hostname = ""
 	}
 
-	// DMI values degrade gracefully: containers (e.g. Docker Desktop on WSL2)
-	// expose empty /sys/class/dmi/id entries, so missing values fall back to
-	// the remaining identity sources instead of failing outright.
-	productUUID := readIdentityFile("/sys/class/dmi/id/product_uuid")
-	productSerial := readIdentityFile("/sys/class/dmi/id/product_serial")
-	boardSerial := readIdentityFile("/sys/class/dmi/id/board_serial")
-	chassisSerial := readIdentityFile("/sys/class/dmi/id/chassis_serial")
+	// DMI values degrade gracefully: containers (e.g. Docker Desktop on WSL2,
+	// KVM guests) often expose empty /sys/class/dmi/id entries, so missing
+	// values fall back to the remaining identity sources instead of failing.
+	// Environment variables take precedence over DMI files, letting operators
+	// pin a stable value per deployment (e.g. -e SUB2API_DMI_PRODUCT_SERIAL=...).
+	productUUID := readDMIValue("SUB2API_DMI_PRODUCT_UUID", "/sys/class/dmi/id/product_uuid")
+	productSerial := readDMIValue("SUB2API_DMI_PRODUCT_SERIAL", "/sys/class/dmi/id/product_serial")
+	boardSerial := readDMIValue("SUB2API_DMI_BOARD_SERIAL", "/sys/class/dmi/id/board_serial")
+	chassisSerial := readDMIValue("SUB2API_DMI_CHASSIS_SERIAL", "/sys/class/dmi/id/chassis_serial")
 
 	identity := licenseIdentity{
 		hostname:      hostname,
@@ -230,6 +232,15 @@ func readIdentityFile(path string) string {
 		return ""
 	}
 	return string(data)
+}
+
+// readDMIValue returns the DMI value from the environment variable when set
+// and non-empty, otherwise from the sysfs file.
+func readDMIValue(envKey, path string) string {
+	if value := os.Getenv(envKey); normalizeLicenseValue(value) != "" {
+		return value
+	}
+	return readIdentityFile(path)
 }
 
 func calculateMachineCode(identity licenseIdentity) string {
