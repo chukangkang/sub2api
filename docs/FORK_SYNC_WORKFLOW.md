@@ -17,18 +17,18 @@
 |---|---|---|
 | `main` | 始终跟随 `upstream/main` | 只接受 fast-forward，不做本地提交 |
 | `anthropic-api-style-v0.2.4` | 0.2.4（分叉点 `bdb42e2`） | **存档分支**，不再更新，仅作移植来源参照 |
-| `anthropic-api-style-v0.2.7` | 上游最新 main（≥ v0.2.7） | **活跃功能分支**，承载全部自有功能 |
+| `anthropic-api-style-v0.2.8` | 上游最新 main（≥ v0.2.8） | **活跃功能分支**，承载全部自有功能 |
 
 ### 分支命名约定
 
 `anthropic-api-style-v<基础版本号>`，后缀是该分支所基于的上游版本（不是下一个发布版本）。
-例：基于 v0.2.7 之后的 main → `anthropic-api-style-v0.2.7`；下次上游出 v0.2.8 后重建 → `anthropic-api-style-v0.2.8`。
+例：基于 v0.2.8 的 main → `anthropic-api-style-v0.2.8`；上游出 v0.2.9 后 rebase 到位即改名为 `anthropic-api-style-v0.2.9`（`git branch -m` + 推新删旧）。
 
-## 2. 自有功能清单（当前在 v0.2.7 分支上）
+## 2. 自有功能清单（当前在 v0.2.8 分支上）
 
 | 功能 | 主要文件 | 备注 |
 |---|---|---|
-| License 机器码绑定 | `backend/cmd/server/main.go` | ed25519 校验（`-sn` 参数）、`-machine-code` 打印注册码、DMI 四项标识必填、内置 `LicensePublicKey`。**只动这一个文件**，是与上游冲突的唯一高风险点 |
+| License 机器码绑定 | `backend/cmd/server/main.go` | ed25519 校验（`-sn` 参数）、`-machine-code` 打印注册码、机器码 = hostname + machine-id + product-uuid 三项必填（`SUB2API_DMI_PRODUCT_UUID` 可 env 覆盖）、内置 `LicensePublicKey`。**只动这一个文件**，是与上游冲突的唯一高风险点 |
 | Anthropic `/v1/messages` 官方对齐 | `backend/internal/handler/gateway_anthropic_validation*.go`、`gateway_handler.go`、`openai_gateway_handler*.go`、`backend/internal/pkg/claude/constants.go`、`backend/internal/service/{domain_constants,setting_features}.go` | 请求校验、thinking 签名校验、max_tokens 上限表、错误 wire 类型对齐 |
 | 杂项 | `.gitignore`（`backend/sub2api-linux*`）、`frontend/package.json`（pnpm `onlyBuiltDependencies`） | 低冲突风险 |
 
@@ -48,9 +48,13 @@ git push origin main
 ### 3.2 功能分支 rebase
 
 ```powershell
-git checkout anthropic-api-style-v0.2.7
+git checkout anthropic-api-style-v0.2.8
 git rebase main
 ```
+
+> 若 rebase 后上游 VERSION 已升版（如 0.2.8 → 0.2.9），顺手改名：
+> `git branch -m anthropic-api-style-v0.2.8 anthropic-api-style-v0.2.9`，
+> `git push -u origin anthropic-api-style-v0.2.9 && git push origin --delete anthropic-api-style-v0.2.8`
 
 预期冲突点（按概率排序）：
 
@@ -85,7 +89,7 @@ go test -tags unit ./internal/service/ -count=1
 ### 3.4 推送
 
 ```powershell
-git push --force-with-lease origin anthropic-api-style-v0.2.7
+git push --force-with-lease origin anthropic-api-style-v0.2.8
 ```
 
 rebase 改写历史，必须强推；用 `--force-with-lease` 防覆盖他人提交。
