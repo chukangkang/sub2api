@@ -89,7 +89,7 @@ func main() {
 	if *showMachineCode {
 		machineCode, err := registrationMachineCode()
 		if err != nil {
-			log.Print("Unable to generate machine code")
+			log.Printf("Unable to generate machine code: %v", err)
 			return
 		}
 		fmt.Println(machineCode)
