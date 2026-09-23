@@ -51,12 +51,9 @@ const (
 )
 
 type licenseIdentity struct {
-	hostname      string
-	machineID     string
-	productUUID   string
-	productSerial string
-	boardSerial   string
-	chassisSerial string
+	hostname    string
+	machineID   string
+	productUUID string
 }
 func init() {
 	// 如果 Version 已通过 ldflags 注入（例如 -X main.Version=...），则不要覆盖。
@@ -187,31 +184,29 @@ func collectLicenseIdentity() (licenseIdentity, error) {
 		hostname = ""
 	}
 
-	// DMI values degrade gracefully: containers (e.g. Docker Desktop on WSL2,
-	// KVM guests) often expose empty /sys/class/dmi/id entries, so missing
-	// values fall back to the remaining identity sources instead of failing.
-	// Environment variables take precedence over DMI files, letting operators
-	// pin a stable value per deployment (e.g. -e SUB2API_DMI_PRODUCT_SERIAL=...).
+	// Machine identity is composed of exactly three required values:
+	// hostname (--hostname), machine-id, and product-uuid. All three must be
+	// present; the remaining DMI fields (serials) are intentionally excluded.
+	// An environment variable may pin product-uuid per deployment.
 	productUUID := readDMIValue("SUB2API_DMI_PRODUCT_UUID", "/sys/class/dmi/id/product_uuid")
-	productSerial := readDMIValue("SUB2API_DMI_PRODUCT_SERIAL", "/sys/class/dmi/id/product_serial")
-	boardSerial := readDMIValue("SUB2API_DMI_BOARD_SERIAL", "/sys/class/dmi/id/board_serial")
-	chassisSerial := readDMIValue("SUB2API_DMI_CHASSIS_SERIAL", "/sys/class/dmi/id/chassis_serial")
 
 	identity := licenseIdentity{
-		hostname:      hostname,
-		machineID:     readFirstIdentityFile("/etc/machine-id", "/var/lib/dbus/machine-id"),
-		productUUID:   productUUID,
-		productSerial: productSerial,
-		boardSerial:   boardSerial,
-		chassisSerial: chassisSerial,
+		hostname:    hostname,
+		machineID:   readFirstIdentityFile("/etc/machine-id", "/var/lib/dbus/machine-id"),
+		productUUID: productUUID,
 	}
-	if normalizeLicenseValue(identity.hostname) == "" &&
-		normalizeLicenseValue(identity.machineID) == "" &&
-		normalizeLicenseValue(identity.productUUID) == "" &&
-		normalizeLicenseValue(identity.productSerial) == "" &&
-		normalizeLicenseValue(identity.boardSerial) == "" &&
-		normalizeLicenseValue(identity.chassisSerial) == "" {
-		return licenseIdentity{}, errors.New("no usable machine identity was found")
+	missing := make([]string, 0, 3)
+	if normalizeLicenseValue(identity.hostname) == "" {
+		missing = append(missing, "hostname")
+	}
+	if normalizeLicenseValue(identity.machineID) == "" {
+		missing = append(missing, "machine-id")
+	}
+	if normalizeLicenseValue(identity.productUUID) == "" {
+		missing = append(missing, "product-uuid")
+	}
+	if len(missing) > 0 {
+		return licenseIdentity{}, errors.New("required machine identity is unavailable: " + strings.Join(missing, ", "))
 	}
 	return identity, nil
 }
@@ -249,13 +244,10 @@ func calculateMachineCode(identity licenseIdentity) string {
 }
 
 func (identity licenseIdentity) canonical() string {
-	return "sub2api-machine-v1\n" +
+	return "sub2api-machine-v2\n" +
 		"hostname=" + normalizeLicenseValue(identity.hostname) + "\n" +
 		"machine-id=" + normalizeLicenseValue(identity.machineID) + "\n" +
-		"product-uuid=" + normalizeLicenseValue(identity.productUUID) + "\n" +
-		"product-serial=" + normalizeLicenseValue(identity.productSerial) + "\n" +
-		"board-serial=" + normalizeLicenseValue(identity.boardSerial) + "\n" +
-		"chassis-serial=" + normalizeLicenseValue(identity.chassisSerial) + "\n"
+		"product-uuid=" + normalizeLicenseValue(identity.productUUID) + "\n"
 }
 
 func normalizeLicenseValue(value string) string {
