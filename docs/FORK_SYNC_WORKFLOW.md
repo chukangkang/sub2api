@@ -117,7 +117,19 @@ rebase 改写历史，必须强推；用 `--force-with-lease` 防覆盖他人提
 
 > 2026-09-23 的 v0.2.4 → v0.2.7 迁移就是按本节执行的，全程仅 2 处实质冲突（main.go license 区、一个测试文件尾部追加）。
 
-## 5. Windows 环境备忘
+## 5. 构建环境备忘
+
+### WSL（首选）
+
+- Debian 发行版内已装：Go 1.27.0（`~/go`，阿里云镜像）、git、python3.13-venv。
+- 打包一行命令（`build-linux.sh` 自带环境自检，无需任何 export）：
+  ```bash
+  wsl -e bash /mnt/e/sd/sub2api/backend/scripts/build-linux.sh
+  ```
+- 产物 `backend/bin/sub2api`（ELF，embed 前端，~117MB）。
+- 坑：`wsl -e bash -c "..."` 里嵌套引号/`$` 极易翻车，复杂命令写成 `.sh` 文件再执行。
+
+### Windows（备用）
 
 - Go 1.27.0 临时 SDK：`%TEMP%\gosdk-parent\go`（`tar -xf` 解压，勿用 Expand-Archive）；
   损坏特征 `package unsafe is not in std` → 重新下载解压，验证 `Test-Path "%TEMP%\gosdk-parent\go\src\unsafe\unsafe.go"`。
