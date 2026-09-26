@@ -1882,7 +1882,7 @@ func (s *GeminiMessagesCompatService) writeGeminiMappedError(c *gin.Context, acc
 	); matched {
 		c.JSON(status, gin.H{
 			"type":  "error",
-			"error": gin.H{"type": errType, "message": errMsg},
+			"error": gin.H{"type": NormalizeClaudeErrorType(status, errType), "message": errMsg},
 		})
 		if upstreamMsg == "" {
 			upstreamMsg = errMsg
@@ -2002,7 +2002,7 @@ func (s *GeminiMessagesCompatService) writeGeminiMappedError(c *gin.Context, acc
 
 	c.JSON(statusCode, gin.H{
 		"type":  "error",
-		"error": gin.H{"type": errType, "message": errMsg},
+		"error": gin.H{"type": NormalizeClaudeErrorType(statusCode, errType), "message": errMsg},
 	})
 	if upstreamMsg == "" {
 		return fmt.Errorf("upstream error: %d", upstreamStatus)
@@ -2422,7 +2422,7 @@ func (s *GeminiMessagesCompatService) writeClaudeError(c *gin.Context, status in
 	MarkResponseCommitted(c)
 	c.JSON(status, gin.H{
 		"type":  "error",
-		"error": gin.H{"type": errType, "message": message},
+		"error": gin.H{"type": NormalizeClaudeErrorType(status, errType), "message": message},
 	})
 	return fmt.Errorf("%s", message)
 }

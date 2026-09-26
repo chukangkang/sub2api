@@ -45,6 +45,16 @@ func (s *SettingService) IsThinkingSignatureValidationEnabled(ctx context.Contex
 	return value != "false"
 }
 
+// IsThinkingSignatureRegistryEnabled 检查是否启用 thinking 签名发放注册表
+// （§2.5b）。默认关闭：设置缺失或查询出错时按关闭处理，仅显式 "true" 开启。
+func (s *SettingService) IsThinkingSignatureRegistryEnabled(ctx context.Context) bool {
+	value, err := s.settingRepo.GetValue(ctx, SettingKeyThinkingSignatureRegistry)
+	if err != nil {
+		return false
+	}
+	return value == "true"
+}
+
 // IsRegistrationEmailDomainQuotaEnabled 检查白名单非空时是否放行非白名单域名限量注册。
 // 安全默认：设置缺失或查询出错时按关闭处理（保持白名单严格模式）。
 func (s *SettingService) IsRegistrationEmailDomainQuotaEnabled(ctx context.Context) bool {

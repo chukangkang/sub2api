@@ -139,6 +139,21 @@ func classifyNoAccountError(
 	return fallback
 }
 
+// anthropicNotFoundStandardMessage 是官方 Error shapes 的标准 404 报文
+// （2026-09-18 核对 platform.claude.com/docs/en/api/errors）。
+const anthropicNotFoundStandardMessage = "The requested resource could not be found."
+
+// standardizeAnthropicNotFoundMessage 将 404 not_found_error 分类的文案替换为
+// 官方标准 404 报文。仅用于 /v1/messages 与 /v1/messages/count_tokens 路径
+// （含 OpenAI 桥接的 Anthropic 风格入口）：官方对齐范围内不暴露内部模型名。
+// 非 Anthropic 入口（chat/completions、responses、embeddings 等）保留描述性文案。
+func standardizeAnthropicNotFoundMessage(cls noAccountErrorClassification) noAccountErrorClassification {
+	if cls.ModelNotFound {
+		cls.Message = anthropicNotFoundStandardMessage
+	}
+	return cls
+}
+
 // classifyNoAccountErrorFromGin is a thin wrapper that forwards the gin
 // context's underlying request context. Most call sites already have a
 // *gin.Context handy, so this keeps the call sites uncluttered.

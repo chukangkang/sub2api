@@ -59,7 +59,9 @@ func TestGatewayHandleErrorResponse_NoRuleKeepsDefault(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
 	errField, ok := payload["error"].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, "upstream_error", errField["type"])
+	// §2.6：Anthropic 路径 error.type 归一到官方集合；"upstream_error" 非官方，
+	// 502 → api_error。
+	assert.Equal(t, "api_error", errField["type"])
 	assert.Equal(t, "Upstream request failed", errField["message"])
 }
 
@@ -165,7 +167,8 @@ func TestGatewayHandleErrorResponse_AppliesRuleFor422(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
 	errField, ok := payload["error"].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, "upstream_error", errField["type"])
+	// §2.6：规则改写状态码为 418（非官方类型映射），"upstream_error" 归一为 api_error。
+	assert.Equal(t, "api_error", errField["type"])
 	assert.Equal(t, "上游请求失败", errField["message"])
 }
 
@@ -220,7 +223,8 @@ func TestGeminiWriteGeminiMappedError_AppliesRuleFor422(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
 	errField, ok := payload["error"].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, "upstream_error", errField["type"])
+	// §2.6：规则改写状态码为 418（非官方类型映射），"upstream_error" 归一为 api_error。
+	assert.Equal(t, "api_error", errField["type"])
 	assert.Equal(t, "Gemini上游失败", errField["message"])
 }
 

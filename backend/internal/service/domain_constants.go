@@ -645,6 +645,12 @@ const (
 	// 必须是合法 base64 且解码后不少于最小长度，否则 400（上游多数链路不验签，网关自守门）。
 	SettingKeyThinkingSignatureValidation = "thinking_signature_validation"
 
+	// SettingKeyThinkingSignatureRegistry /v1/messages thinking 签名发放注册表开关（§2.5b）。
+	// 默认关闭；仅显式 "true" 开启。开启后：上游 200 响应中的签名会被登记，
+	// 请求侧结构校验通过的签名还必须命中注册表，否则 400 "signature not recognized"。
+	// 冷启动（从未登记过）期间 fail-open，只做结构校验。
+	SettingKeyThinkingSignatureRegistry = "thinking_signature_registry"
+
 	// SettingKeyAllowUngroupedKeyScheduling 允许未分组 API Key 调度（默认 false：未分组 Key 返回 403）
 	SettingKeyAllowUngroupedKeyScheduling = "allow_ungrouped_key_scheduling"
 	// SettingKeyOpenAILowUpstreamRatePriorityEnabled 旧调度是否按上游 token 倍率优先。

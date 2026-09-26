@@ -456,7 +456,7 @@ func (s *GatewayService) handleErrorResponse(ctx context.Context, resp *http.Res
 		c.JSON(status, gin.H{
 			"type": "error",
 			"error": gin.H{
-				"type":    errType,
+				"type":    NormalizeClaudeErrorType(status, errType),
 				"message": errMsg,
 			},
 		})
@@ -512,11 +512,11 @@ func (s *GatewayService) handleErrorResponse(ctx context.Context, resp *http.Res
 		errMsg = "Upstream request failed"
 	}
 
-	// 返回自定义错误响应
+	// 返回自定义错误响应（error.type 归一到官方集合，§2.6）
 	c.JSON(statusCode, gin.H{
 		"type": "error",
 		"error": gin.H{
-			"type":    errType,
+			"type":    NormalizeClaudeErrorType(statusCode, errType),
 			"message": errMsg,
 		},
 	})
@@ -621,7 +621,7 @@ func (s *GatewayService) handleRetryExhaustedError(ctx context.Context, resp *ht
 		c.JSON(status, gin.H{
 			"type": "error",
 			"error": gin.H{
-				"type":    errType,
+				"type":    NormalizeClaudeErrorType(status, errType),
 				"message": errMsg,
 			},
 		})
@@ -636,11 +636,11 @@ func (s *GatewayService) handleRetryExhaustedError(ctx context.Context, resp *ht
 		return nil, fmt.Errorf("upstream error: %d (retries exhausted, passthrough rule matched) message=%s", resp.StatusCode, summary)
 	}
 
-	// 返回统一的重试耗尽错误响应
+	// 返回统一的重试耗尽错误响应（error.type 归一到官方集合，§2.6）
 	c.JSON(http.StatusBadGateway, gin.H{
 		"type": "error",
 		"error": gin.H{
-			"type":    "upstream_error",
+			"type":    NormalizeClaudeErrorType(http.StatusBadGateway, "upstream_error"),
 			"message": "Upstream request failed after retries",
 		},
 	})

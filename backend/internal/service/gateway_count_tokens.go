@@ -632,12 +632,12 @@ func sanitizeCountTokensRequestBody(body []byte) []byte {
 	return out
 }
 
-// countTokensError 返回 count_tokens 错误响应
+// countTokensError 返回 count_tokens 错误响应（error.type 归一到官方集合，§2.6）
 func (s *GatewayService) countTokensError(c *gin.Context, status int, errType, message string) {
 	c.JSON(status, gin.H{
 		"type": "error",
 		"error": gin.H{
-			"type":    errType,
+			"type":    NormalizeClaudeErrorType(status, errType),
 			"message": message,
 		},
 	})

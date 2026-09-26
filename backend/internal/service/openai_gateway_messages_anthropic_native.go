@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -266,6 +267,7 @@ func (s *OpenAIGatewayService) handleNativeAnthropicBufferedResponse(
 		contentType = "application/json"
 	}
 	body = reverseToolNamesIfPresent(c, body)
+	RegisterHarvestedSignatures(c.Request.Context(), s.settingService, body)
 	c.Data(resp.StatusCode, contentType, body)
 
 	return &OpenAIForwardResult{
@@ -332,6 +334,18 @@ func (s *OpenAIGatewayService) handleNativeAnthropicStreamingResponse(
 	var firstTokenMs *int
 	clientDisconnected := false
 	sawTerminalEvent := false
+
+	// 签名发放注册表（§2.5b，可选增强）：开关开启时按 SSE 事件收割签名。
+	sigAcc := newStreamThinkingAccumulator()
+	if s.settingService != nil && s.settingService.IsThinkingSignatureRegistryEnabled(ctx) {
+		if reg := GetSignatureRegistry(); reg != nil {
+			if uid, _ := ctx.Value(ctxkey.UserID).(int64); uid > 0 {
+				if m, _ := ctx.Value(ctxkey.Model).(string); strings.TrimSpace(m) != "" {
+					sigAcc.bindRegistry(reg, uid, m)
+				}
+			}
+		}
+	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -451,6 +465,7 @@ func (s *OpenAIGatewayService) handleNativeAnthropicStreamingResponse(
 			if data, ok := extractAnthropicSSEDataLine(line); ok {
 				trimmed := strings.TrimSpace(data)
 				observer.ObserveAnthropic([]byte(trimmed))
+				sigAcc.Feed(ctx, []byte(trimmed))
 				if anthropicStreamEventIsTerminal("", trimmed) {
 					sawTerminalEvent = true
 				}

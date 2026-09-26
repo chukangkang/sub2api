@@ -220,12 +220,19 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	}
 
 	// thinking 块签名结构校验（可配置，默认开）：上游多数链路不验签，
-	// 网关自守门，客户端传了格式坏的签名（非 base64/过短）直接 400。
-	// 仅 /v1/messages 生效；count_tokens 端点不做此项。
+	// 网关自守门，客户端传了格式坏的签名（非 base64/过短/骨架坏/跨模型重放）
+	// 直接 400。仅 /v1/messages 生效；count_tokens 端点不做此项。
 	if h.settingService != nil && h.settingService.IsThinkingSignatureValidationEnabled(c.Request.Context()) {
-		if serr := validateThinkingSignatures(body); serr != nil {
+		if serr := validateThinkingSignatures(body, reqModel); serr != nil {
 			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", serr.Error())
 			return
+		}
+		// 签名发放注册表校验（可选增强，默认关）：热态下要求签名命中注册表。
+		if h.settingService.IsThinkingSignatureRegistryEnabled(c.Request.Context()) {
+			if serr := checkThinkingSignatureRegistry(c.Request.Context(), body, subject.UserID, reqModel); serr != nil {
+				h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", serr.Error())
+				return
+			}
 		}
 	}
 
@@ -672,7 +679,8 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), currentAPIKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, parsedReq.MetadataUserID, subject.UserID)
 			if err != nil {
 				if len(fs.FailedAccountIDs) == 0 {
-					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, currentAPIKey, reqModel, reqModel, platform)
+					// /v1/messages 路径：404 统一为官方标准报文（§2.7）
+					cls := standardizeAnthropicNotFoundMessage(classifyNoAccountErrorFromGin(c, h.gatewayService, currentAPIKey, reqModel, reqModel, platform))
 					if !cls.ModelNotFound {
 						markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 					}
@@ -2071,6 +2079,10 @@ func (h *GatewayHandler) errorResponse(c *gin.Context, status int, errType, mess
 }
 
 func (h *GatewayHandler) errorResponseWithCode(c *gin.Context, status int, errType, code, message string) {
+	// Claude 路径错误类型归一化（§2.6）：JSON 出口的 error.type 强制落入
+	// 官方集合，防止内部类型名（upstream_error 等）或 "<nil>" 泄漏给客户端。
+	// 已是官方类型则原样保留（真上游 Anthropic 错误透传不受影响）。
+	errType = normalizeClaudeErrorType(status, errType)
 	errorObject := gin.H{"type": errType, "message": message}
 	if code != "" {
 		errorObject["code"] = code
@@ -2186,7 +2198,8 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 	account, err := h.gatewayService.SelectAccountForModel(c.Request.Context(), apiKey.GroupID, sessionHash, parsedReq.Model)
 	if err != nil {
 		reqLog.Warn("gateway.count_tokens_select_account_failed", zap.Error(err))
-		cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, parsedReq.Model, parsedReq.Model, service.PlatformAnthropic)
+		// /v1/messages/count_tokens 路径：404 统一为官方标准报文（§2.7）
+		cls := standardizeAnthropicNotFoundMessage(classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, parsedReq.Model, parsedReq.Model, service.PlatformAnthropic))
 		if !cls.ModelNotFound {
 			markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 		}

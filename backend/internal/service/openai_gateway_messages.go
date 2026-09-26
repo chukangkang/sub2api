@@ -1345,11 +1345,12 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 }
 
 // writeAnthropicError writes an error response in Anthropic Messages API format.
+// error.type 归一到官方集合（§2.6），防止内部类型名泄漏给客户端。
 func writeAnthropicError(c *gin.Context, statusCode int, errType, message string) {
 	c.JSON(statusCode, gin.H{
 		"type": "error",
 		"error": gin.H{
-			"type":    errType,
+			"type":    NormalizeClaudeErrorType(statusCode, errType),
 			"message": message,
 		},
 	})

@@ -1143,7 +1143,7 @@ func (h *OpenAIGatewayHandler) logOpenAIRemoteCompactOutcome(c *gin.Context, sta
 //
 // requireMaxTokens 区分 /v1/messages(true) 与 count_tokens(false)。
 // 返回 false 表示已写出 400 响应，调用方应立即 return。
-func (h *OpenAIGatewayHandler) validateAnthropicBridgeRequest(c *gin.Context, body []byte, reqModel string, requireMaxTokens bool) bool {
+func (h *OpenAIGatewayHandler) validateAnthropicBridgeRequest(c *gin.Context, body []byte, reqModel string, requireMaxTokens bool, userID int64) bool {
 	if !isClaudeFamilyModel(reqModel) {
 		return true
 	}
@@ -1153,9 +1153,16 @@ func (h *OpenAIGatewayHandler) validateAnthropicBridgeRequest(c *gin.Context, bo
 	}
 	// thinking 块签名结构校验（可配置，默认开）：与原生 Anthropic 路径一致。
 	if h.settingService != nil && h.settingService.IsThinkingSignatureValidationEnabled(c.Request.Context()) {
-		if serr := validateThinkingSignatures(body); serr != nil {
+		if serr := validateThinkingSignatures(body, reqModel); serr != nil {
 			h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", serr.Error())
 			return false
+		}
+		// 签名发放注册表校验（可选增强，默认关）：热态下要求签名命中注册表。
+		if h.settingService.IsThinkingSignatureRegistryEnabled(c.Request.Context()) {
+			if serr := checkThinkingSignatureRegistry(c.Request.Context(), body, userID, reqModel); serr != nil {
+				h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", serr.Error())
+				return false
+			}
 		}
 	}
 	return true
@@ -1229,7 +1236,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	// thinking / output_config / display / speed 等专有字段在转换时被丢弃，
 	// 若不在此处校验，非法参数（如 Opus 5 上传 enabled、假枚举值）会被静默放行。
 	// 非 Claude 模型（grok / deepseek / qwen 等）保持既有透传行为，不受影响。
-	if !h.validateAnthropicBridgeRequest(c, body, reqModel, true) {
+	if !h.validateAnthropicBridgeRequest(c, body, reqModel, true, subject.UserID) {
 		return
 	}
 
@@ -1340,7 +1347,8 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			)
 			if len(failedAccountIDs) == 0 {
 				if err != nil {
-					cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+					// /v1/messages 路径：404 统一为官方标准报文（§2.7）
+					cls := standardizeAnthropicNotFoundMessage(classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel))
 					if !cls.ModelNotFound {
 						markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 					}
@@ -1357,7 +1365,8 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			}
 		}
 		if selection == nil || selection.Account == nil {
-			cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+			// /v1/messages 路径：404 统一为官方标准报文（§2.7）
+			cls := standardizeAnthropicNotFoundMessage(classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel))
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
 			}
@@ -1591,6 +1600,9 @@ func resolveOpenAIMessagesMetadataSession(c *gin.Context, sessionHash, promptCac
 
 // anthropicErrorResponse writes an error in Anthropic Messages API format.
 func (h *OpenAIGatewayHandler) anthropicErrorResponse(c *gin.Context, status int, errType, message string) {
+	// Claude 路径错误类型归一化（§2.6）：JSON 出口的 error.type 强制落入
+	// 官方集合，防止内部类型名泄漏给客户端。
+	errType = normalizeClaudeErrorType(status, errType)
 	c.JSON(status, gin.H{
 		"type": "error",
 		"error": gin.H{
