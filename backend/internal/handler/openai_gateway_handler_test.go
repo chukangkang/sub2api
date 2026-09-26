@@ -3373,7 +3373,7 @@ func TestValidateAnthropicBridgeRequest_NonClaudeModelPassesThrough(t *testing.T
 	h := &OpenAIGatewayHandler{}
 	body := `{"model":"gpt-5.6-sol","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"__bogus__"}}`
 	c, w := newBridgeValidationContext(t, body)
-	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "gpt-5.6-sol", true))
+	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "gpt-5.6-sol", true, 0))
 	require.Zero(t, w.Body.Len(), "non-claude model must not produce an error response")
 }
 
@@ -3382,7 +3382,7 @@ func TestValidateAnthropicBridgeRequest_Opus5EnabledRejected(t *testing.T) {
 	h := &OpenAIGatewayHandler{}
 	body := `{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1024}}`
 	c, w := newBridgeValidationContext(t, body)
-	ok := h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true)
+	ok := h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true, 0)
 	require.False(t, ok)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	// JSON 序列化会把文案中的引号转义为 \"
@@ -3394,7 +3394,7 @@ func TestValidateAnthropicBridgeRequest_BogusThinkingTypeRejected(t *testing.T) 
 	h := &OpenAIGatewayHandler{}
 	body := `{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"__bogus_mode_xyz__"}}`
 	c, w := newBridgeValidationContext(t, body)
-	ok := h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true)
+	ok := h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true, 0)
 	require.False(t, ok)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	require.Contains(t, w.Body.String(), `\"thinking.type\" must be one of`)
@@ -3405,7 +3405,7 @@ func TestValidateAnthropicBridgeRequest_AdaptiveAccepted(t *testing.T) {
 	h := &OpenAIGatewayHandler{}
 	body := `{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"}}`
 	c, w := newBridgeValidationContext(t, body)
-	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true))
+	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true, 0))
 	require.Zero(t, w.Body.Len())
 }
 
@@ -3416,10 +3416,10 @@ func TestValidateAnthropicBridgeRequest_SignatureCheckedWhenEnabled(t *testing.T
 	sig := "!!!not-valid-base64!!!"
 	body := fmt.Sprintf(`{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":%q}]},{"role":"user","content":"hi"}]}`, sig)
 	c, w := newBridgeValidationContext(t, body)
-	ok := h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true)
+	ok := h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true, 0)
 	require.False(t, ok)
 	require.Equal(t, http.StatusBadRequest, w.Code)
-	require.Contains(t, w.Body.String(), "signature is not valid base64")
+	require.Contains(t, w.Body.String(), "Invalid `signature` in `thinking` block")
 }
 
 func TestValidateAnthropicBridgeRequest_SignatureSkippedWhenDisabled(t *testing.T) {
@@ -3431,7 +3431,7 @@ func TestValidateAnthropicBridgeRequest_SignatureSkippedWhenDisabled(t *testing.
 	sig := "!!!not-valid-base64!!!"
 	body := fmt.Sprintf(`{"model":"claude-opus-5","max_tokens":4096,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":%q}]},{"role":"user","content":"hi"}]}`, sig)
 	c, w := newBridgeValidationContext(t, body)
-	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true))
+	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", true, 0))
 	require.Zero(t, w.Body.Len())
 }
 
@@ -3440,6 +3440,6 @@ func TestValidateAnthropicBridgeRequest_CountTokensAllowsMissingMaxTokens(t *tes
 	h := &OpenAIGatewayHandler{}
 	body := `{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`
 	c, w := newBridgeValidationContext(t, body)
-	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", false))
+	require.True(t, h.validateAnthropicBridgeRequest(c, []byte(body), "claude-opus-5", false, 0))
 	require.Zero(t, w.Body.Len())
 }

@@ -233,7 +233,7 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 	reqModel := parsedReq.Model
 
 	// 与 Messages 一致：Claude 家族模型做官方参数校验（count_tokens 不要求 max_tokens）。
-	if !h.validateAnthropicBridgeRequest(c, body, reqModel, false) {
+	if !h.validateAnthropicBridgeRequest(c, body, reqModel, false, subject.UserID) {
 		return
 	}
 
@@ -286,7 +286,8 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 	if err != nil {
 		requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
 		reqLog.Warn("openai_count_tokens.account_select_failed", zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)))
-		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+		// /v1/messages/count_tokens 路径：404 统一为官方标准报文（§2.7）
+		cls := standardizeAnthropicNotFoundMessage(classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel))
 		if !cls.ModelNotFound {
 			markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 		}
@@ -294,7 +295,8 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 		return
 	}
 	if account == nil {
-		cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+		// /v1/messages/count_tokens 路径：404 统一为官方标准报文（§2.7）
+		cls := standardizeAnthropicNotFoundMessage(classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel))
 		if !cls.ModelNotFound {
 			markOpsRoutingCapacityLimited(c)
 		}

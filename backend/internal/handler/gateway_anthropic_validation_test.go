@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"encoding/base64"
 	"fmt"
 	"testing"
 
@@ -151,6 +152,27 @@ func TestValidateAnthropicRequest_MessageContentMissing(t *testing.T) {
 }
 
 func TestValidateAnthropicRequest_SecondMessageRoleInvalid(t *testing.T) {
+	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [
+		{"role": "user", "content": "hi"},
+		{"role": "tool", "content": "result"}
+	]}`
+	err := validateAnthropicRequest([]byte(body), true, "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `"messages[1].role" must be one of: "user", "assistant"`)
+}
+
+// R10 位置敏感（2026-09-18 真伪验证实测）：真实 API 只对第一条消息严格要求
+// user/assistant；中间位置的 system 角色放行（200）。
+func TestValidateAnthropicRequest_SystemRoleMidConversationAllowed(t *testing.T) {
+	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [
+		{"role": "user", "content": "hi"},
+		{"role": "system", "content": "you are terse"},
+		{"role": "user", "content": "again"}
+	]}`
+	require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
+}
+
+func TestValidateAnthropicRequest_OtherRolesStillRejectedMidConversation(t *testing.T) {
 	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [
 		{"role": "user", "content": "hi"},
 		{"role": "tool", "content": "result"}
@@ -482,6 +504,168 @@ func TestValidateAnthropicRequest_DisabledWithHighEffortRejected(t *testing.T) {
 	// 不带 effort 的 disabled 放行
 	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`
 	require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
+}
+
+func TestValidateAnthropicRequest_DisabledWithHighEffort_NonOpus5Accepted(t *testing.T) {
+	// 官方脚注②只挂在 Opus 5 行：Sonnet 5 / Fable / Mythos 5.x 的
+	// disabled + xhigh/max 应放行（2026-09-26 实测 sonnet-5 返回 200，
+	// 测试台用例 thinking.disabled_xhigh_accepted）。
+	models := []string{
+		"claude-sonnet-5", "claude-sonnet-5-20260701",
+		"claude-fable-5", "claude-fable-5-1",
+		"claude-mythos-5", "claude-mythos-5-1",
+		"claude-opus-4-8", "claude-opus-4-7",
+	}
+	for _, model := range models {
+		for _, effort := range []string{"xhigh", "max"} {
+			t.Run(fmt.Sprintf("%s_%s", model, effort), func(t *testing.T) {
+				body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}, "output_config": {"effort": "%s"}}`, model, effort)
+				require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
+			})
+		}
+	}
+}
+
+func TestValidateAnthropicRequest_Opus55Matrix(t *testing.T) {
+	// 官方（2026-09-25 文档）：Opus 5.5 thinking 默认开启且仅接受 adaptive，
+	// disabled/enabled 均 400；拒绝非默认采样参数；拒绝 forced tool_choice；
+	// 拒绝 assistant prefill；max_tokens 上限 128000。
+	const model = "claude-opus-5-5"
+
+	t.Run("adaptive_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}}`, model)
+		require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("no_thinking_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}`, model)
+		require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("enabled_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
+	})
+	t.Run("disabled_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`, model)
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), `"thinking.type.disabled" is not supported for this model`)
+	})
+	t.Run("sampling_temp_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "temperature": 0.7}`, model)
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"temperature" must be 1.0 for this model`, err.Error())
+	})
+	t.Run("sampling_topk_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "top_k": 40}`, model)
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"top_k" is not supported for this model`, err.Error())
+	})
+	t.Run("forced_tool_choice_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "tools": [{"name": "f", "description": "d", "input_schema": {"type": "object"}}], "tool_choice": {"type": "any"}}`, model)
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `tool_choice: type "tool" and "any" are not supported for this model.`, err.Error())
+	})
+	t.Run("prefill_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "partial"}]}`, model)
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `This model does not support assistant message prefill. The conversation must end with a user message.`, err.Error())
+	})
+	t.Run("max_tokens_boundary", func(t *testing.T) {
+		okBody := fmt.Sprintf(`{"model": "%s", "max_tokens": 128000, "messages": [{"role": "user", "content": "hi"}]}`, model)
+		require.NoError(t, validateAnthropicRequest([]byte(okBody), true, ""))
+		badBody := fmt.Sprintf(`{"model": "%s", "max_tokens": 128001, "messages": [{"role": "user", "content": "hi"}]}`, model)
+		err := validateAnthropicRequest([]byte(badBody), true, "")
+		require.Error(t, err)
+		require.Equal(t, `'max_tokens': 128001 > 128000 - 'max_tokens' should be smaller than or equal to 128000`, err.Error())
+	})
+	t.Run("dated_variant_normalized", func(t *testing.T) {
+		// 带日期后缀的变体应归一到 opus-5-5 家族
+		body := `{"model": "claude-opus-5-5-20260901", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`
+		require.Error(t, validateAnthropicRequest([]byte(body), true, ""))
+	})
+}
+
+func TestValidateAnthropicRequest_ImageBlocks(t *testing.T) {
+	img := func(mediaType string) string {
+		return fmt.Sprintf(`{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": %q, "data": "iVBORw0KGgo"}}, {"type": "text", "text": "describe"}]}]}`, mediaType)
+	}
+
+	// 官方支持的四种 media_type 全部放行
+	for _, mt := range []string{"image/jpeg", "image/png", "image/gif", "image/webp"} {
+		t.Run(mt, func(t *testing.T) {
+			require.NoError(t, validateAnthropicRequest([]byte(img(mt)), true, ""))
+		})
+	}
+
+	// 官方实测原文（2026-09-26 用户提供）：pydantic v2 风格
+	t.Run("unsupported_media_type_official_message", func(t *testing.T) {
+		err := validateAnthropicRequest([]byte(img("image/tiff")), true, "")
+		require.Error(t, err)
+		require.Equal(t, `messages[0].content[0].source.base64.media_type: Input should be 'image/jpeg', 'image/png', 'image/gif' or 'image/webp'`, err.Error())
+	})
+
+	t.Run("missing_media_type", func(t *testing.T) {
+		body := `{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo"}}]}]}`
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `messages[0].content[0].source.base64.media_type: Field required`, err.Error())
+	})
+
+	t.Run("missing_data", func(t *testing.T) {
+		body := `{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png"}}]}]}`
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `messages[0].content[0].source.base64.data: Field required`, err.Error())
+	})
+
+	t.Run("unknown_source_type", func(t *testing.T) {
+		body := `{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "datauri", "data": "x"}}]}]}`
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `messages[0].content[0].source.type: Input should be 'base64', 'url' or 'file'`, err.Error())
+	})
+
+	t.Run("url_source_ok", func(t *testing.T) {
+		body := `{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}]}]}`
+		require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
+	})
+
+	t.Run("url_source_missing_url", func(t *testing.T) {
+		body := `{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url"}}]}]}`
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `messages[0].content[0].source.url.url: Field required`, err.Error())
+	})
+
+	t.Run("file_source_ok", func(t *testing.T) {
+		body := `{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "file", "file_id": "file_01ABC"}}]}]}`
+		require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
+	})
+
+	t.Run("file_source_missing_file_id", func(t *testing.T) {
+		body := `{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "file"}}]}]}`
+		err := validateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `messages[0].content[0].source.file.file_id: Field required`, err.Error())
+	})
+
+	t.Run("tool_result_wrapper_passes", func(t *testing.T) {
+		// tool_result 外壳本身合法即放行；其嵌套 content 内的 image 块
+		// 暂不递归校验（官方嵌套路径的错误文案无实证，留待实测后再收紧）
+		body := `{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/bmp", "data": "x"}}]}]}]}`
+		require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
+	})
+
+	t.Run("plain_string_content_skipped", func(t *testing.T) {
+		body := `{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}`
+		require.NoError(t, validateAnthropicRequest([]byte(body), true, ""))
+	})
 }
 
 func TestValidateAnthropicRequest_Thinking_Opus48_Sonnet5(t *testing.T) {
@@ -841,15 +1025,64 @@ func TestValidateAnthropicRequest_SpeedStandardAlwaysAccepted(t *testing.T) {
 
 // ── thinking 块签名结构校验 ──
 
-// longValidSig 是一个合法 base64、解码后远超最小长度的签名（模拟真实签名）。
-const longValidSig = "CAISuyMKpgEIERgCKkCozyv1jDNFSU1VkqYoVveGjyGIeEuG7iAuUN2RtIb6MXhssIMBOlwsr+v0knDmsgp7nWdfdTC7"
+// synthPBBytes 把一个 length-delimited 字段编码为 protobuf 字节。
+func synthPBBytes(fieldNum int32, data []byte) []byte {
+	tag := byte((fieldNum<<3)|2)
+	out := make([]byte, 0, 2+len(data))
+	out = append(out, tag)
+	out = append(out, synthPBVarint(uint64(len(data)))...)
+	return append(out, data...)
+}
+
+// synthPBVarint 编码 protobuf varint（测试用）。
+func synthPBVarint(v uint64) []byte {
+	var out []byte
+	for v >= 0x80 {
+		out = append(out, byte(v)|0x80)
+		v >>= 7
+	}
+	return append(out, byte(v))
+}
+
+// makeSyntheticThinkingSignature 按 §2.5a 逆向出的布局构造一份能通过
+// 第 1/2/3 层校验的合成签名：
+//
+//	outer: field1 varint=2（版本标记，可选） + field2=inner + field3 varint=1
+//	inner: field1=meta(≥128B，含模型名+"thinking"+UUID)
+//	       + field2/field3 时间戳短块 + field4 48B + field5=blob(≥256B)
+func makeSyntheticThinkingSignature(model string) string {
+	meta := make([]byte, 0, 200)
+	meta = append(meta, []byte(model)...)
+	meta = append(meta, []byte("thinking")...)
+	meta = append(meta, []byte("Z$6f1e2c3d-4a5b-4c6d-8e7f-0a1b2c3d4e5f$r")...)
+	for len(meta) < 168 {
+		meta = append(meta, 'x')
+	}
+	blob := make([]byte, 300)
+	for i := range blob {
+		blob[i] = byte(i * 7)
+	}
+	inner := make([]byte, 0, 512)
+	inner = append(inner, synthPBBytes(1, meta)...)
+	inner = append(inner, synthPBBytes(2, make([]byte, 12))...)
+	inner = append(inner, synthPBBytes(3, make([]byte, 12))...)
+	inner = append(inner, synthPBBytes(4, make([]byte, 48))...)
+	inner = append(inner, synthPBBytes(5, blob)...)
+
+	outer := make([]byte, 0, len(inner)+8)
+	outer = append(outer, 0x08, 0x02) // field1 varint = 2
+	outer = append(outer, synthPBBytes(2, inner)...)
+	outer = append(outer, 0x18, 0x01) // field3 varint = 1
+	return base64.StdEncoding.EncodeToString(outer)
+}
 
 func TestValidateThinkingSignatures_ValidSignatureAccepted(t *testing.T) {
+	sig := makeSyntheticThinkingSignature("claude-opus-5")
 	body := fmt.Sprintf(`{"model": "claude-opus-5", "max_tokens": 100, "messages": [
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
 		{"role": "user", "content": "hi"}
-	]}`, longValidSig)
-	require.NoError(t, validateThinkingSignatures([]byte(body)))
+	]}`, sig)
+	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
 }
 
 func TestValidateThinkingSignatures_NonBase64Rejected(t *testing.T) {
@@ -857,10 +1090,10 @@ func TestValidateThinkingSignatures_NonBase64Rejected(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "!!!not-base64$$$"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	err := validateThinkingSignatures([]byte(body))
+	err := validateThinkingSignatures([]byte(body), "claude-opus-5")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "messages.0.content.0")
-	require.Contains(t, err.Error(), "not valid base64")
+	require.Contains(t, err.Error(), "Invalid `signature` in `thinking` block")
 }
 
 func TestValidateThinkingSignatures_TooShortRejected(t *testing.T) {
@@ -869,7 +1102,7 @@ func TestValidateThinkingSignatures_TooShortRejected(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "AAAA"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	err := validateThinkingSignatures([]byte(body))
+	err := validateThinkingSignatures([]byte(body), "claude-opus-5")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "too short")
 }
@@ -880,7 +1113,7 @@ func TestValidateThinkingSignatures_EmptySignatureSkipped(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": ""}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	require.NoError(t, validateThinkingSignatures([]byte(body)))
+	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
 }
 
 func TestValidateThinkingSignatures_MissingSignatureSkipped(t *testing.T) {
@@ -888,7 +1121,7 @@ func TestValidateThinkingSignatures_MissingSignatureSkipped(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	require.NoError(t, validateThinkingSignatures([]byte(body)))
+	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
 }
 
 func TestValidateThinkingSignatures_UserMessageIgnored(t *testing.T) {
@@ -897,20 +1130,97 @@ func TestValidateThinkingSignatures_UserMessageIgnored(t *testing.T) {
 		{"role": "user", "content": [{"type": "thinking", "thinking": "hmm", "signature": "AAA"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	require.NoError(t, validateThinkingSignatures([]byte(body)))
+	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
 }
 
-func TestValidateThinkingSignatures_RedactedThinkingChecked(t *testing.T) {
+func TestValidateThinkingSignatures_RedactedThinkingLayer1Only(t *testing.T) {
+	// redacted_thinking 只做第 1 层：非 base64 仍拦
 	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [
 		{"role": "assistant", "content": [{"type": "redacted_thinking", "signature": "!!!bad$$$"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	err := validateThinkingSignatures([]byte(body))
+	err := validateThinkingSignatures([]byte(body), "claude-opus-5")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "not valid base64")
+	require.Contains(t, err.Error(), "Invalid `signature` in `thinking` block")
+}
+
+func TestValidateThinkingSignatures_RedactedThinkingSkipsSkeletonLayers(t *testing.T) {
+	// redacted_thinking 的签名结构未取样确认：合法 base64 + ≥32B 即放行，
+	// 即使不是良构 protobuf（骨架/深度指纹层跳过）。
+	raw := make([]byte, 64)
+	for i := range raw {
+		raw[i] = 0xFF
+	}
+	sig := base64.StdEncoding.EncodeToString(raw)
+	body := fmt.Sprintf(`{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "redacted_thinking", "signature": "%s"}]},
+		{"role": "user", "content": "hi"}
+	]}`, sig)
+	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
+}
+
+func TestValidateThinkingSignatures_FirstByteTamperRejected(t *testing.T) {
+	// C3 用例：首字节篡改破坏外层 tag → 骨架层 malformed
+	sig := makeSyntheticThinkingSignature("claude-opus-5")
+	decoded, _ := base64.StdEncoding.DecodeString(sig)
+	decoded[0] ^= 0xFF
+	tampered := base64.StdEncoding.EncodeToString(decoded)
+	body := fmt.Sprintf(`{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
+		{"role": "user", "content": "hi"}
+	]}`, tampered)
+	err := validateThinkingSignatures([]byte(body), "claude-opus-5")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "signature is malformed")
+}
+
+func TestValidateThinkingSignatures_CrossModelReplayRejected(t *testing.T) {
+	// 深度指纹层：opus-5 的真签名配 sonnet-5 的请求 → 模型名不一致 → malformed
+	sig := makeSyntheticThinkingSignature("claude-opus-5")
+	body := fmt.Sprintf(`{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
+		{"role": "user", "content": "hi"}
+	]}`, sig)
+	err := validateThinkingSignatures([]byte(body), "claude-sonnet-5")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "signature is malformed")
+}
+
+func TestValidateThinkingSignatures_ModelStickyBoundaryTolerated(t *testing.T) {
+	// 元数据中模型名与相邻字节粘连（"...58"）时仍能匹配（压缩比较）
+	sig := makeSyntheticThinkingSignature("claude-opus-5")
+	body := fmt.Sprintf(`{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
+		{"role": "user", "content": "hi"}
+	]}`, sig)
+	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
+}
+
+func TestValidateThinkingSignatures_DatedModelIDNotMisrejected(t *testing.T) {
+	// 回归：元数据里存的是不带日期的基础模型名（如 "claude-opus-5"），
+	// 而客户端请求用的是带日期后缀的正规 ID（如 "claude-opus-5-20251101"）。
+	// 旧逻辑按压缩字符串精确比较，会把这种正规签名误判 malformed。
+	sig := makeSyntheticThinkingSignature("claude-opus-5")
+	body := fmt.Sprintf(`{"model": "claude-opus-5-20251101", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
+		{"role": "user", "content": "hi"}
+	]}`, sig)
+	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5-20251101"))
+}
+
+func TestValidateThinkingSignatures_DatedModelIDCrossModelStillRejected(t *testing.T) {
+	// 带日期后缀也不放过真正的跨模型重放：opus-5 签名配 sonnet-5 日期 ID
+	sig := makeSyntheticThinkingSignature("claude-opus-5")
+	body := fmt.Sprintf(`{"model": "claude-sonnet-5-20251101", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
+		{"role": "user", "content": "hi"}
+	]}`, sig)
+	err := validateThinkingSignatures([]byte(body), "claude-sonnet-5-20251101")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "signature is malformed")
 }
 
 func TestValidateThinkingSignatures_NoAssistantMessages(t *testing.T) {
 	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}`
-	require.NoError(t, validateThinkingSignatures([]byte(body)))
+	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
 }

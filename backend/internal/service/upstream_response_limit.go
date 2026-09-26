@@ -62,11 +62,12 @@ func ReadUpstreamResponseBody(reader io.Reader, cfg *config.Config, c *gin.Conte
 }
 
 // anthropicTooLargeError 以 Anthropic Messages API 格式写入超限错误。
+// error.type 归一到官方集合（502 → api_error，§2.6）。
 func anthropicTooLargeError(c *gin.Context) {
 	c.JSON(http.StatusBadGateway, gin.H{
 		"type": "error",
 		"error": gin.H{
-			"type":    "upstream_error",
+			"type":    NormalizeClaudeErrorType(http.StatusBadGateway, "upstream_error"),
 			"message": "Upstream response too large",
 		},
 	})

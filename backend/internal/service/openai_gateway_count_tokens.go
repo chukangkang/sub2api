@@ -483,7 +483,7 @@ func writeAnthropicCountTokensError(c *gin.Context, status int, errType, message
 	c.JSON(status, gin.H{
 		"type": "error",
 		"error": gin.H{
-			"type":    errType,
+			"type":    NormalizeClaudeErrorType(status, errType),
 			"message": message,
 		},
 	})

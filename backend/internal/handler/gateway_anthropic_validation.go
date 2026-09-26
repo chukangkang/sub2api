@@ -6,7 +6,7 @@ package handler
 // 400 + invalid_request_error 响应给客户端。
 
 import (
-	"encoding/base64"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,6 +14,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 // isClaudeFamilyModel 判断请求的模型是否属于 Claude 家族
@@ -36,20 +37,25 @@ func isClaudeFamilyModel(model string) bool {
 const thinkingSignatureMinDecodedLen = 32
 
 // validateThinkingSignatures 对请求体中 assistant 消息里的 thinking /
-// redacted_thinking 块做签名结构校验。
+// redacted_thinking 块做签名结构校验（三层，见 §2.5）。
 //
 // 背景：上游（尤其经 New-API 等中转的 Opus 5 链路）普遍不校验 thinking 签名
 // 的内容，坏签名会被照单全收。为了让本网关自守门，这里在转发前主动把关：
 //   - signature 字段缺失或为空串：放行（交由既有的预过滤/整流逻辑处理，
 //     那些路径专门负责"缺签名"场景，避免在此重复拦截）。
-//   - signature 存在且非空：必须是合法 base64，且解码后不少于
-//     thinkingSignatureMinDecodedLen 字节，否则返回 400 风格错误。
+//   - signature 存在且非空：依次通过三层校验：
+//     1. base64+长度（thinking + redacted_thinking）；
+//     2. 骨架（仅 thinking）：外层良构 protobuf + field2 内层良构；
+//     3. 深度指纹（仅 thinking）：元数据/密文尺寸 + "thinking" 常量 + UUID +
+//        模型名一致性（拦跨模型重放）。
 //
-// 该检查是纯结构性的：它只能识别"格式坏了"的签名（空/截断/乱码/非 base64），
-// 无法识别"格式合法但内容被篡改"的签名（网关没有 Anthropic 密钥，做不了密码学
-// 验签）。因此对"上游每轮签发新签名"这一正常情形天然免疫——只要新签名格式合法
-// 就会放行，不会因为"和上一次不一样"而被误杀。
-func validateThinkingSignatures(body []byte) error {
+// 该检查是纯结构性的：无法识别"格式合法但密文主体内部被篡改"的签名（网关没有
+// Anthropic 密钥，做不了密码学验签；如需拦截该类篡改，开启签名发放注册表，
+// 见 gateway_anthropic_signature_registry.go）。因此对"上游每轮签发新签名"
+// 这一正常情形天然免疫——只要新签名格式合法就会放行。
+//
+// requestModel 是请求体顶层 model（可为空）；非空时参与第 3 层模型名比对。
+func validateThinkingSignatures(body []byte, requestModel string) error {
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {
 		return nil
@@ -74,25 +80,80 @@ func validateThinkingSignatures(body []byte) error {
 			if err := checkThinkingSignatureFormat(sig.Str); err != nil {
 				return fmt.Errorf("messages.%d.content.%d: %v", mi, bi, err)
 			}
+			// 第 2/3 层仅作用于 thinking 块：redacted_thinking 的签名结构
+			// 尚未取样确认，跳过以免误杀。
+			if btype == "thinking" {
+				if err := checkThinkingSignatureStructure(sig.Str, requestModel); err != nil {
+					return fmt.Errorf("messages.%d.content.%d: %v", mi, bi, err)
+				}
+			}
 		}
 	}
 	return nil
 }
 
-// checkThinkingSignatureFormat 校验单个签名字符串的结构合法性。
-// 错误文案对齐官方 "Invalid `signature` in `thinking` block" 的风格。
+// checkThinkingSignatureRegistry 对请求体中 assistant 消息里的 thinking /
+// redacted_thinking 块做签名发放注册表校验（§2.5b，可选增强）。
+//
+// 语义：
+//   - 注册表未初始化（nil）→ 放行；
+//   - 冷态（从未登记过，IsWarm=false）→ fail-open 放行，只做结构校验；
+//   - 热态 → 每个带签名的块必须命中 (userID, model) 桶中的配对指纹，
+//     否则 400 "signature not recognized"（拦跨用户重放/换绑攻击）。
+//
+// 配对指纹 = hex(sha256(sig ‖ "\x00" ‖ thinking))；redacted_thinking 无可见
+// 文本，按裸签名指纹记账。
+func checkThinkingSignatureRegistry(ctx context.Context, body []byte, userID int64, requestModel string) error {
+	reg := service.GetSignatureRegistry()
+	if reg == nil || userID <= 0 || strings.TrimSpace(requestModel) == "" {
+		return nil
+	}
+	if !reg.IsWarm(ctx) {
+		return nil
+	}
+	msgs := gjson.GetBytes(body, "messages")
+	if !msgs.IsArray() {
+		return nil
+	}
+	for mi, m := range msgs.Array() {
+		if m.Get("role").Str != "assistant" {
+			continue
+		}
+		content := m.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for bi, block := range content.Array() {
+			btype := block.Get("type").Str
+			if btype != "thinking" && btype != "redacted_thinking" {
+				continue
+			}
+			sig := block.Get("signature")
+			if !sig.Exists() || sig.Type != gjson.String || sig.Str == "" {
+				continue
+			}
+			text := ""
+			if btype == "thinking" {
+				text = block.Get("thinking").Str
+			}
+			fp := service.SignaturePairFingerprint(sig.Str, text)
+			if !reg.Contains(ctx, userID, requestModel, fp) {
+				return fmt.Errorf("messages.%d.content.%d: Invalid `signature` in `thinking` block: signature not recognized", mi, bi)
+			}
+		}
+	}
+	return nil
+}
+
+// checkThinkingSignatureFormat 校验单个签名字符串的第 1 层结构合法性
+// （合法 base64 + 最小解码长度）。错误文案逐字对齐官方风格。
 func checkThinkingSignatureFormat(sig string) error {
-	const badBase64 = "Invalid `signature` in `thinking` block: signature is not valid base64"
+	const badBase64 = "Invalid `signature` in `thinking` block"
 	const tooShort = "Invalid `signature` in `thinking` block: signature is too short"
 
-	decoded, err := base64.StdEncoding.DecodeString(sig)
-	if err != nil {
-		// 兼容 URL-safe base64（个别客户端/上游可能使用）
-		if decoded2, err2 := base64.URLEncoding.DecodeString(sig); err2 == nil {
-			decoded = decoded2
-		} else {
-			return errors.New(badBase64)
-		}
+	decoded, ok := decodeSignatureBase64(sig)
+	if !ok {
+		return errors.New(badBase64)
 	}
 	if len(decoded) < thinkingSignatureMinDecodedLen {
 		return errors.New(tooShort)
@@ -150,10 +211,66 @@ func validateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 			return fmt.Errorf("\"messages[%d].role\" must be a string", i)
 		}
 		if role.Str != "user" && role.Str != "assistant" {
-			return fmt.Errorf("\"messages[%d].role\" must be one of: \"user\", \"assistant\"", i)
+			// R10 位置敏感（2026-09-18 真伪验证实测）：真实 API 只对第一条消息
+			// 严格要求 user/assistant；中间位置的 system 角色放行（200）。
+			if !(i > 0 && role.Str == "system") {
+				return fmt.Errorf("\"messages[%d].role\" must be one of: \"user\", \"assistant\"", i)
+			}
 		}
 		if !m.Get("content").Exists() {
 			return fmt.Errorf("\"messages[%d].content\" is a required property", i)
+		}
+	}
+
+	// ── image 块：source.type + media_type（官方 Vision 文档 2026-09-21 快照）──
+	// 官方：image 块有三种 source（base64/url/file）；base64 的 media_type
+	// 仅支持 image/jpeg、image/png、image/gif、image/webp（GIF 只取首帧）。
+	// media_type 非法的 400 文案为官方实测原文（pydantic v2 风格，2026-09-26
+	// 用户提供）：<path>.source.base64.media_type: Input should be
+	// 'image/jpeg', 'image/png', 'image/gif' or 'image/webp'。
+	// 其余结构性文案（Field required 等）为 pydantic 风格推断，待实测校准。
+	for i, m := range arr {
+		content := m.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for j, blk := range content.Array() {
+			if blk.Get("type").Str != "image" {
+				continue
+			}
+			src := blk.Get("source")
+			if !src.Exists() || !src.IsObject() {
+				return fmt.Errorf(`"messages[%d].content[%d].source" is a required property`, i, j)
+			}
+			st := src.Get("type")
+			if !st.Exists() || st.Type != gjson.String {
+				return fmt.Errorf(`"messages[%d].content[%d].source.type" is a required property`, i, j)
+			}
+			switch st.Str {
+			case "base64":
+				mt := src.Get("media_type")
+				if !mt.Exists() || mt.Type != gjson.String {
+					return fmt.Errorf(`messages[%d].content[%d].source.base64.media_type: Field required`, i, j)
+				}
+				switch mt.Str {
+				case "image/jpeg", "image/png", "image/gif", "image/webp":
+				default:
+					return fmt.Errorf(`messages[%d].content[%d].source.base64.media_type: Input should be 'image/jpeg', 'image/png', 'image/gif' or 'image/webp'`, i, j)
+				}
+				if d := src.Get("data"); !d.Exists() || d.Type != gjson.String || d.Str == "" {
+					return fmt.Errorf(`messages[%d].content[%d].source.base64.data: Field required`, i, j)
+				}
+			case "url":
+				if u := src.Get("url"); !u.Exists() || u.Type != gjson.String || u.Str == "" {
+					return fmt.Errorf(`messages[%d].content[%d].source.url.url: Field required`, i, j)
+				}
+			case "file":
+				if f := src.Get("file_id"); !f.Exists() || f.Type != gjson.String || f.Str == "" {
+					return fmt.Errorf(`messages[%d].content[%d].source.file.file_id: Field required`, i, j)
+				}
+			default:
+				return fmt.Errorf(`messages[%d].content[%d].source.type: Input should be 'base64', 'url' or 'file'`, i, j)
+			}
 		}
 	}
 
@@ -307,12 +424,15 @@ func validateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 		}
 	}
 
-	// ── thinking.type=disabled + effort=xhigh/max 组合：Opus 5 起不可关思考 ──
-	// 官方：Claude Opus 5 及之后模型在 xhigh/max effort 下无法关闭 thinking，
-	// 两者组合返回 400。低档 effort（≤high）允许 disabled。
+	// ── thinking.type=disabled + effort=xhigh/max 组合：仅 Opus 5 不可关思考 ──
+	// 官方《思考功能故障排查》模型表的脚注②只挂在 Claude Opus 5 行：
+	// effort ≤ high 时接受 disabled，与 xhigh/max 组合返回 400。
+	// Sonnet 5 / Fable / Mythos 5.x 的官方行没有此交互说明，且 2026-09-26
+	// 实测 sonnet-5 的 disabled+xhigh 返回 200（测试台 thinking.disabled_xhigh_accepted），
+	// 故该限制收窄到仅 claude-opus-5，其余模型 fail-open。
 	if th := gjson.GetBytes(body, "thinking"); th.Exists() && th.Get("type").Str == "disabled" {
 		if eff := gjson.GetBytes(body, "output_config.effort"); eff.Exists() && eff.Type == gjson.String {
-			if eff.Str == "xhigh" || eff.Str == "max" {
+			if (eff.Str == "xhigh" || eff.Str == "max") && familyRejectsDisabledWithHighEffort(model.Str) {
 				return errors.New(`"thinking.type" value "disabled" is not supported with "output_config.effort" value "`+eff.Str+`" for this model`)
 			}
 		}
@@ -333,8 +453,8 @@ var allEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
 
 // modelMaxOutputTokens 返回模型的同步 Messages API 最大输出 token 上限。
 // 依据官方各模型页（2026-09-17 逐一核实）：
-//   - 128K：Fable 5.1 / Fable 5 / Mythos 5 / Mythos 5.1 / Opus 5 / Sonnet 5 /
-//     Opus 4.7 / 4.8 / Opus 4.6 / Sonnet 4.6
+//   - 128K：Fable 5.1 / Fable 5 / Mythos 5 / Mythos 5.1 / Opus 5.5 / Opus 5 /
+//     Sonnet 5 / Opus 4.7 / 4.8 / Opus 4.6 / Sonnet 4.6
 //   - 64K：Haiku 4.5 / Opus 4.5 / Sonnet 4.5
 //
 // Mythos 5 官方明言与 Fable 5 共享规格（128K）；mythos-preview 无公开规格页，
@@ -347,7 +467,7 @@ func modelMaxOutputTokens(model string) (int, bool) {
 	switch normalizeThinkingModelFamily(model) {
 	case "claude-fable-5-1", "claude-fable-5",
 		"claude-mythos-5-1", "claude-mythos-5",
-		"claude-opus-5", "claude-sonnet-5",
+		"claude-opus-5-5", "claude-opus-5", "claude-sonnet-5",
 		"claude-opus-4-8", "claude-opus-4-7",
 		"claude-opus-4-6", "claude-sonnet-4-6":
 		return 128000, true
@@ -404,7 +524,7 @@ func familySupportsPrefillReject(model string) bool {
 	switch family {
 	case "claude-opus-4-6", "claude-sonnet-4-6",
 		"claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
-		"claude-sonnet-5",
+		"claude-opus-5-5", "claude-sonnet-5",
 		"claude-fable-5", "claude-fable-5-1",
 		"claude-mythos-5", "claude-mythos-5-1":
 		return true
@@ -413,13 +533,22 @@ func familySupportsPrefillReject(model string) bool {
 }
 
 // familyRejectsForcedToolChoice 判断模型是否拒绝 tool_choice 的 "tool"/"any"：
-// Claude Fable 5.1 与 Claude Mythos 5.1。
+// Claude Fable 5.1、Claude Mythos 5.1 与 Claude Opus 5.5（官方 2026-09-25
+// 文档 "Response prefill and forced tool use"：三者对每个请求都 400）。
 func familyRejectsForcedToolChoice(model string) bool {
 	switch normalizeThinkingModelFamily(model) {
-	case "claude-fable-5-1", "claude-mythos-5-1":
+	case "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5":
 		return true
 	}
 	return false
+}
+
+// familyRejectsDisabledWithHighEffort 判断模型是否在 effort=xhigh/max 下
+// 拒绝 thinking.type=disabled。官方脚注②仅标注在 Claude Opus 5 行；
+// Sonnet 5 / Fable / Mythos 5.x 实测（2026-09-26）disabled+xhigh 返回 200，
+// 不在此集合内。
+func familyRejectsDisabledWithHighEffort(model string) bool {
+	return normalizeThinkingModelFamily(model) == "claude-opus-5"
 }
 
 // familyRejectsSamplingParams 判断模型是否拒绝非默认采样参数：
@@ -432,7 +561,7 @@ func familyRejectsSamplingParams(model string) bool {
 	}
 	switch family {
 	case "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
-		"claude-sonnet-5",
+		"claude-opus-5-5", "claude-sonnet-5",
 		"claude-fable-5", "claude-fable-5-1",
 		"claude-mythos-5", "claude-mythos-5-1":
 		return true
@@ -468,6 +597,7 @@ func assistantHasTextContent(msg gjson.Result) bool {
 //	|-----------------------|-----------------------------|-------------------------|
 //	| Fable 5.1 / 5        | adaptive, disabled*         | enabled                 |
 //	| Mythos 5.1 / 5       | adaptive, disabled*         | enabled                 |
+//	| Opus 5.5             | adaptive                    | enabled, disabled       |
 //	| Opus 5               | adaptive, disabled          | enabled                 |
 //	| Opus 4.8 / 4.7       | adaptive                    | enabled                 |
 //	| Sonnet 5             | adaptive                    | enabled                 |
@@ -494,6 +624,11 @@ var thinkingTypeRules = map[string][]string{
 	"claude-fable-5":    {"adaptive", "disabled"},
 	"claude-mythos-5":   {"adaptive", "disabled"},
 	"claude-opus-5":     {"adaptive", "disabled"},
+
+	// Opus 5.5: thinking 默认开启且仅接受 adaptive；官方（2026-09-25 文档
+	// "Turning thinking off"）明言 Opus 5.5 与 Fable/Mythos 5.1 并列
+	// reject disabled，enabled 亦不支持（仅自适应）。
+	"claude-opus-5-5": {"adaptive"},
 
 	// 自适应为主，默认关闭 (adaptive + disabled; 仅 enabled 被 400 拒绝)
 	"claude-opus-4-8": {"adaptive", "disabled"},
