@@ -2,7 +2,7 @@
 
 > 适用对象：`chukangkang/sub2api`（fork）相对上游 `Wei-Shaw/sub2api` 的自有功能分支。
 > 本文档描述如何在上游持续更新时，低成本地把自有功能同步到新版本基线上。
-> 最后更新：2026-09-23
+> 最后更新：2026-10-19
 
 ## 1. 仓库与远程布局
 
@@ -17,7 +17,8 @@
 |---|---|---|
 | `main` | 始终跟随 `upstream/main` | 只接受 fast-forward，不做本地提交 |
 | `anthropic-api-style-v0.2.4` | 0.2.4（分叉点 `bdb42e2`） | **存档分支**，不再更新，仅作移植来源参照 |
-| `anthropic-api-style-v0.2.8` | 上游最新 main（≥ v0.2.8） | **活跃功能分支**，承载全部自有功能 |
+| `anthropic-api-style-v0.2.8` | 上游 v0.2.8 | **存档分支**（2026-10-19 起），仅作移植来源参照 |
+| `anthropic-api-style-v0.2.17` | 上游最新 main（v0.2.17） | **活跃功能分支**，承载全部自有功能 |
 
 ### 分支命名约定
 
@@ -48,13 +49,13 @@ git push origin main
 ### 3.2 功能分支 rebase
 
 ```powershell
-git checkout anthropic-api-style-v0.2.8
+git checkout anthropic-api-style-v0.2.17
 git rebase main
 ```
 
-> 若 rebase 后上游 VERSION 已升版（如 0.2.8 → 0.2.9），顺手改名：
-> `git branch -m anthropic-api-style-v0.2.8 anthropic-api-style-v0.2.9`，
-> `git push -u origin anthropic-api-style-v0.2.9 && git push origin --delete anthropic-api-style-v0.2.8`
+> 若 rebase 后上游 VERSION 已升版（如 0.2.17 → 0.2.18），顺手改名：
+> `git branch -m anthropic-api-style-v0.2.17 anthropic-api-style-v0.2.18`，
+> `git push -u origin anthropic-api-style-v0.2.18 && git push origin --delete anthropic-api-style-v0.2.17`
 
 预期冲突点（按概率排序）：
 
@@ -89,10 +90,14 @@ go test -tags unit ./internal/service/ -count=1
 ### 3.4 推送
 
 ```powershell
-git push --force-with-lease origin anthropic-api-style-v0.2.8
+git push --force-with-lease origin anthropic-api-style-v0.2.17
 ```
 
 rebase 改写历史，必须强推；用 `--force-with-lease` 防覆盖他人提交。
+
+> 实战补充（2026-10-19，v0.2.15 → v0.2.17）：
+> - rebase 前若有上次中断的残留（暂存区脏 + 一堆与 main 相同的未跟踪文件），先 `git reset --hard <分支>`，再用 `git hash-object` 对比未跟踪文件与 `main:<path>` 的 blob，一致的删掉再 rebase。
+> - 本轮冲突点：`wire.go`/`wire_gen.go`（上游新增 CompositeRouteResolver/GeminiCachedContent 注入 vs 我方 SettingService 注入，两侧叠加）、`no_account_error.go`（上游 GPT-5.5 退役文案 vs 我方 not_found_error 统一，保留双方）、上游新测试 `TestClassifyNoAccountError_GPT55Retirement` 断言旧 wire type 需同步改为 `not_found_error`。
 
 ### 3.5 提 PR
 
