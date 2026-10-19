@@ -310,7 +310,8 @@ func TestClassifyNoAccountError_GPT55Retirement(t *testing.T) {
 	fd := &fakeDiagnoser{resp: service.ModelAvailabilityDiagnosis{HasAccountsInPool: true, HasRetiredSubscriptionModel: true}}
 	cls := classifyNoAccountError(context.Background(), fd, apiKey, "gpt-5.5", "legacy", service.PlatformOpenAI)
 	require.Equal(t, http.StatusNotFound, cls.Status)
-	require.Equal(t, "model_not_found", cls.ErrType)
+	// 与官方 Anthropic 404 错误类型保持一致（not_found_error），所有入口统一透传。
+	require.Equal(t, "not_found_error", cls.ErrType)
 	require.Contains(t, cls.Message, "retired")
 	require.Contains(t, cls.Message, "API-key")
 	fd.resp.HasModelSupport = true
