@@ -37,25 +37,26 @@ func isClaudeFamilyModel(model string) bool {
 const thinkingSignatureMinDecodedLen = 32
 
 // validateThinkingSignatures 对请求体中 assistant 消息里的 thinking /
-// redacted_thinking 块做签名结构校验（三层，见 §2.5）。
+// redacted_thinking 块做签名结构校验（两层，见 §2.5）。
 //
 // 背景：上游（尤其经 New-API 等中转的 Opus 5 链路）普遍不校验 thinking 签名
 // 的内容，坏签名会被照单全收。为了让本网关自守门，这里在转发前主动把关：
 //   - signature 字段缺失或为空串：放行（交由既有的预过滤/整流逻辑处理，
 //     那些路径专门负责"缺签名"场景，避免在此重复拦截）。
-//   - signature 存在且非空：依次通过三层校验：
+//   - signature 存在且非空：依次通过两层校验：
 //     1. base64+长度（thinking + redacted_thinking）；
-//     2. 骨架（仅 thinking）：外层良构 protobuf + field2 内层良构；
-//     3. 深度指纹（仅 thinking）：元数据/密文尺寸 + "thinking" 常量 + UUID +
-//        模型名一致性（拦跨模型重放）。
+//     2. 骨架（仅 thinking）：外层良构 protobuf + field2 内层良构。
+//
+// 历史：原第 3 层"深度指纹"（元数据/密文尺寸 + "thinking" 常量 + UUID + 模型名
+// 一致）已于 2026-10-19 移除——渠道模型映射或会话中途切换模型时，合法的历史
+// 签名会被误判为跨模型重放，导致 Claude Code 等长历史客户端大量 400；跨模型
+// 重放防御交由可选的签名发放注册表（§2.5b）承担。
 //
 // 该检查是纯结构性的：无法识别"格式合法但密文主体内部被篡改"的签名（网关没有
 // Anthropic 密钥，做不了密码学验签；如需拦截该类篡改，开启签名发放注册表，
 // 见 gateway_anthropic_signature_registry.go）。因此对"上游每轮签发新签名"
 // 这一正常情形天然免疫——只要新签名格式合法就会放行。
-//
-// requestModel 是请求体顶层 model（可为空）；非空时参与第 3 层模型名比对。
-func validateThinkingSignatures(body []byte, requestModel string) error {
+func validateThinkingSignatures(body []byte) error {
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {
 		return nil
@@ -80,10 +81,10 @@ func validateThinkingSignatures(body []byte, requestModel string) error {
 			if err := checkThinkingSignatureFormat(sig.Str); err != nil {
 				return fmt.Errorf("messages.%d.content.%d: %v", mi, bi, err)
 			}
-			// 第 2/3 层仅作用于 thinking 块：redacted_thinking 的签名结构
+			// 第 2 层（骨架）仅作用于 thinking 块：redacted_thinking 的签名结构
 			// 尚未取样确认，跳过以免误杀。
 			if btype == "thinking" {
-				if err := checkThinkingSignatureStructure(sig.Str, requestModel); err != nil {
+				if err := checkThinkingSignatureStructure(sig.Str); err != nil {
 					return fmt.Errorf("messages.%d.content.%d: %v", mi, bi, err)
 				}
 			}

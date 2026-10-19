@@ -223,10 +223,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	}
 
 	// thinking 块签名结构校验（可配置，默认开）：上游多数链路不验签，
-	// 网关自守门，客户端传了格式坏的签名（非 base64/过短/骨架坏/跨模型重放）
+	// 网关自守门，客户端传了格式坏的签名（非 base64/过短/骨架坏）
 	// 直接 400。仅 /v1/messages 生效；count_tokens 端点不做此项。
 	if h.settingService != nil && h.settingService.IsThinkingSignatureValidationEnabled(c.Request.Context()) {
-		if serr := validateThinkingSignatures(body, reqModel); serr != nil {
+		if serr := validateThinkingSignatures(body); serr != nil {
 			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", serr.Error())
 			return
 		}

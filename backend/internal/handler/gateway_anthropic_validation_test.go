@@ -1082,7 +1082,7 @@ func TestValidateThinkingSignatures_ValidSignatureAccepted(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
 		{"role": "user", "content": "hi"}
 	]}`, sig)
-	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
 }
 
 func TestValidateThinkingSignatures_NonBase64Rejected(t *testing.T) {
@@ -1090,7 +1090,7 @@ func TestValidateThinkingSignatures_NonBase64Rejected(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "!!!not-base64$$$"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	err := validateThinkingSignatures([]byte(body), "claude-opus-5")
+	err := validateThinkingSignatures([]byte(body))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "messages.0.content.0")
 	require.Contains(t, err.Error(), "Invalid `signature` in `thinking` block")
@@ -1102,7 +1102,7 @@ func TestValidateThinkingSignatures_TooShortRejected(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "AAAA"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	err := validateThinkingSignatures([]byte(body), "claude-opus-5")
+	err := validateThinkingSignatures([]byte(body))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "too short")
 }
@@ -1113,7 +1113,7 @@ func TestValidateThinkingSignatures_EmptySignatureSkipped(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": ""}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
 }
 
 func TestValidateThinkingSignatures_MissingSignatureSkipped(t *testing.T) {
@@ -1121,7 +1121,7 @@ func TestValidateThinkingSignatures_MissingSignatureSkipped(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
 }
 
 func TestValidateThinkingSignatures_UserMessageIgnored(t *testing.T) {
@@ -1130,7 +1130,7 @@ func TestValidateThinkingSignatures_UserMessageIgnored(t *testing.T) {
 		{"role": "user", "content": [{"type": "thinking", "thinking": "hmm", "signature": "AAA"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
 }
 
 func TestValidateThinkingSignatures_RedactedThinkingLayer1Only(t *testing.T) {
@@ -1139,14 +1139,14 @@ func TestValidateThinkingSignatures_RedactedThinkingLayer1Only(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "redacted_thinking", "signature": "!!!bad$$$"}]},
 		{"role": "user", "content": "hi"}
 	]}`
-	err := validateThinkingSignatures([]byte(body), "claude-opus-5")
+	err := validateThinkingSignatures([]byte(body))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Invalid `signature` in `thinking` block")
 }
 
 func TestValidateThinkingSignatures_RedactedThinkingSkipsSkeletonLayers(t *testing.T) {
 	// redacted_thinking 的签名结构未取样确认：合法 base64 + ≥32B 即放行，
-	// 即使不是良构 protobuf（骨架/深度指纹层跳过）。
+	// 即使不是良构 protobuf（骨架层跳过）。
 	raw := make([]byte, 64)
 	for i := range raw {
 		raw[i] = 0xFF
@@ -1156,7 +1156,7 @@ func TestValidateThinkingSignatures_RedactedThinkingSkipsSkeletonLayers(t *testi
 		{"role": "assistant", "content": [{"type": "redacted_thinking", "signature": "%s"}]},
 		{"role": "user", "content": "hi"}
 	]}`, sig)
-	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
 }
 
 func TestValidateThinkingSignatures_FirstByteTamperRejected(t *testing.T) {
@@ -1169,58 +1169,34 @@ func TestValidateThinkingSignatures_FirstByteTamperRejected(t *testing.T) {
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
 		{"role": "user", "content": "hi"}
 	]}`, tampered)
-	err := validateThinkingSignatures([]byte(body), "claude-opus-5")
+	err := validateThinkingSignatures([]byte(body))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "signature is malformed")
 }
 
-func TestValidateThinkingSignatures_CrossModelReplayRejected(t *testing.T) {
-	// 深度指纹层：opus-5 的真签名配 sonnet-5 的请求 → 模型名不一致 → malformed
+func TestValidateThinkingSignatures_CrossModelHistoryAccepted(t *testing.T) {
+	// 回归（2026-10-19 移除第 3 层深度指纹）：opus-5 的签名出现在 sonnet-5
+	// 请求的历史里（渠道模型映射 / 会话中途切换模型）不再误判 malformed；
+	// 跨模型重放的防御交由可选的签名发放注册表（§2.5b）承担。
 	sig := makeSyntheticThinkingSignature("claude-opus-5")
 	body := fmt.Sprintf(`{"model": "claude-sonnet-5", "max_tokens": 100, "messages": [
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
 		{"role": "user", "content": "hi"}
 	]}`, sig)
-	err := validateThinkingSignatures([]byte(body), "claude-sonnet-5")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "signature is malformed")
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
 }
 
-func TestValidateThinkingSignatures_ModelStickyBoundaryTolerated(t *testing.T) {
-	// 元数据中模型名与相邻字节粘连（"...58"）时仍能匹配（压缩比较）
-	sig := makeSyntheticThinkingSignature("claude-opus-5")
-	body := fmt.Sprintf(`{"model": "claude-opus-5", "max_tokens": 100, "messages": [
-		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
-		{"role": "user", "content": "hi"}
-	]}`, sig)
-	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
-}
-
-func TestValidateThinkingSignatures_DatedModelIDNotMisrejected(t *testing.T) {
-	// 回归：元数据里存的是不带日期的基础模型名（如 "claude-opus-5"），
-	// 而客户端请求用的是带日期后缀的正规 ID（如 "claude-opus-5-20251101"）。
-	// 旧逻辑按压缩字符串精确比较，会把这种正规签名误判 malformed。
-	sig := makeSyntheticThinkingSignature("claude-opus-5")
-	body := fmt.Sprintf(`{"model": "claude-opus-5-20251101", "max_tokens": 100, "messages": [
-		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
-		{"role": "user", "content": "hi"}
-	]}`, sig)
-	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5-20251101"))
-}
-
-func TestValidateThinkingSignatures_DatedModelIDCrossModelStillRejected(t *testing.T) {
-	// 带日期后缀也不放过真正的跨模型重放：opus-5 签名配 sonnet-5 日期 ID
+func TestValidateThinkingSignatures_DatedModelIDCrossModelAccepted(t *testing.T) {
+	// 带日期后缀的跨模型历史同样放行（同上，第 3 层已移除）
 	sig := makeSyntheticThinkingSignature("claude-opus-5")
 	body := fmt.Sprintf(`{"model": "claude-sonnet-5-20251101", "max_tokens": 100, "messages": [
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
 		{"role": "user", "content": "hi"}
 	]}`, sig)
-	err := validateThinkingSignatures([]byte(body), "claude-sonnet-5-20251101")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "signature is malformed")
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
 }
 
 func TestValidateThinkingSignatures_NoAssistantMessages(t *testing.T) {
 	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}`
-	require.NoError(t, validateThinkingSignatures([]byte(body), "claude-opus-5"))
+	require.NoError(t, validateThinkingSignatures([]byte(body)))
 }

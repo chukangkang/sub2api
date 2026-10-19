@@ -1176,7 +1176,7 @@ func (h *OpenAIGatewayHandler) validateAnthropicBridgeRequest(c *gin.Context, bo
 	}
 	// thinking 块签名结构校验（可配置，默认开）：与原生 Anthropic 路径一致。
 	if h.settingService != nil && h.settingService.IsThinkingSignatureValidationEnabled(c.Request.Context()) {
-		if serr := validateThinkingSignatures(body, reqModel); serr != nil {
+		if serr := validateThinkingSignatures(body); serr != nil {
 			h.anthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", serr.Error())
 			return false
 		}
